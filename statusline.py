@@ -38,10 +38,11 @@ def main() -> None:
     raw = sys.stdin.read()
     data = json.loads(raw)
 
-    # DEBUG: dump raw input to file for inspection
-    debug_path = os.path.join(os.path.dirname(__file__), "debug_input.json")
-    with open(debug_path, "w", encoding="utf-8") as df:
-        json.dump(data, df, indent=2)
+    # DEBUG: dump raw input when STATUSLINE_DEBUG=1
+    if os.environ.get("STATUSLINE_DEBUG") == "1":
+        debug_path = os.path.join(os.path.dirname(__file__), "debug_input.json")
+        with open(debug_path, "w", encoding="utf-8") as df:
+            json.dump(data, df, indent=2)
 
     model = data.get("model", {}).get("display_name", "Unknown")
     # Compact context size hints: "(1M context)" → "1M"
