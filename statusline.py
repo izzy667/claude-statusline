@@ -50,6 +50,20 @@ def main() -> None:
         if tag in model:
             model = model.replace(tag, tag[1:tag.index(" ")])
             break
+
+    # --- Effort level from ~/.claude/settings.json ---
+    effort = ""
+    try:
+        settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+        with open(settings_path, "r", encoding="utf-8") as sf:
+            settings = json.load(sf)
+        raw_effort = str(settings.get("effortLevel", "")).lower()
+        abbrev = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
+        effort = abbrev.get(raw_effort, raw_effort)
+    except (OSError, json.JSONDecodeError):
+        pass
+    if effort:
+        model = f"{model} E/{effort}"
     cwd = data.get("workspace", {}).get("current_dir", ".")
     transcript_path = data.get("transcript_path", "")
 
