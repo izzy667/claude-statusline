@@ -495,6 +495,11 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
 
 # --- Cost ---
 
+def format_money(value: float) -> str:
+    # Above $9.99 cents are noise — show whole dollars
+    return f"${value:.0f}" if value > 9.99 else f"${value:.2f}"
+
+
 def cost_segment(data: dict, stats: dict) -> str:
     cost = stats["usd"]
     cost_obj = data.get("cost")
@@ -506,10 +511,10 @@ def cost_segment(data: dict, stats: dict) -> str:
     burn = ""
     burn_base = official if official is not None else (cost if cost > 0 else None)
     if burn_base is not None and duration_ms and duration_ms >= BURN_RATE_MIN_MS:
-        burn = f" ${burn_base / (duration_ms / 3_600_000):.2f}/h"
+        burn = f" {format_money(burn_base / (duration_ms / 3_600_000))}/h"
 
     if official is not None:
-        return f"~${cost:.2f} (${official:.2f}{burn})"
+        return f"~${cost:.2f} ({format_money(official)}{burn})"
     return f"~${cost:.2f}{burn}"
 
 
