@@ -9,7 +9,10 @@ osłony przed crashami (statusline nigdy nie drukuje tracebacka), git w worktree
 submodułach / podkatalogach repo, jednoprzebiegowy parser transkryptu z przyrostowym
 cache'em offsetu, timeout + scalenie wywołań gita, burn rate `$/h`, kolorowanie %
 kontekstu, segment `+N/-N` linii, effort z payloadu (`effort.level`), czas sesji z
-`cost.total_duration_ms`.
+`cost.total_duration_ms`, agregacja transkryptów subagentów/workflow
+(`<katalog-transkryptu>/<id-sesji>/**/*.jsonl`) i wycena per wpis z `message.model`
+(sesje mieszają modele — bez tego szacunek nie zgadzał się z oficjalnym
+`total_cost_usd` nawet 5x przy sesjach z workflow).
 
 ## Do zrobienia
 
@@ -29,12 +32,12 @@ wpis `{"type":"ai-title","aiTitle":...}` z transkryptu (automatyczny tytuł sesj
 nadawany przez Claude Code; zweryfikowany w realnych plikach) → dopiero obecna
 heurystyka Task.
 
-### 3. Koszt dzienny ze wszystkich sesji („today: $12.40") — wartość: średnia, nakład: duży
+### 3. Koszt dzienny ze wszystkich sesji („today: $12.40") — wartość: średnia, nakład: średni
 Agregacja dzisiejszego wydatku ze wszystkich `~/.claude/projects/*/*.jsonl`
-(filtr po mtime). Wymaga: deduplikacji po `message.id` (już jest w skrypcie),
-wyceny per `message.model` (sesje mieszają modele — pole zweryfikowane w transkryptach)
-i współdzielonego pliku cache z totalami dziennymi. Najbardziej wartościowe dla
-użytkowników planów Max — mapuje się wprost na limity.
+(filtr po mtime). Klocki już istnieją w skrypcie: deduplikacja po `message.id`,
+wycena per `message.model` i przyrostowy cache per plik — zostaje pętla po sesjach
+z dzisiejszym mtime i współdzielony plik cache z totalami dziennymi. Najbardziej
+wartościowe dla użytkowników planów Max — mapuje się wprost na limity.
 
 ### 4. Udział czekania na API („api 38%") — wartość: niska, nakład: mały
 `cost.total_api_duration_ms / cost.total_duration_ms` — ile czasu sesji to czekanie

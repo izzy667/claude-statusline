@@ -22,8 +22,9 @@ MAGENTA = "\033[0;35m"
 CYAN = "\033[0;36m"
 GRAY = "\033[0;37m"
 
-# Base rates per MTok: (input, output); cache: write=1.25x input, read=0.1x input
+# Rates per MTok: (input, output); cache: write=1.25x input, read=0.1x input
 # Verified against platform.claude.com pricing, 2026-06.
+# Display-name families — fallback for transcript entries without a model id.
 # More specific keys first — "Opus 4.1" must win over "Opus".
 BASE_RATES = {
     "Opus 4.1": (15, 75),  # deprecated, retires 2026-08-05
@@ -33,14 +34,25 @@ BASE_RATES = {
     "Sonnet": (3, 15),
     "Haiku": (1, 5),
 }
+# Model-id substrings (lowercase, most specific first) — per-entry pricing;
+# one session mixes models (subagents often run on a different tier).
+MODEL_RATES = (
+    ("opus-4-1", (15, 75)),  # deprecated, retires 2026-08-05
+    ("fable", (10, 50)),
+    ("mythos", (10, 50)),
+    ("opus", (5, 25)),
+    ("haiku", (1, 5)),
+    ("sonnet", (3, 15)),
+)
 DEFAULT_RATE = (3, 15)
 
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
-CACHE_VERSION = 2
+# Bump on schema OR pricing changes — cached usd values depend on the rate tables
+CACHE_VERSION = 3
 USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_MS = 300_000  # hide burn rate for sessions under 5 minutes (too noisy)
-RECENT_IDS_MAX = 50  # dedup window: streamed duplicates are near-consecutive in practice
+RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
 
 
 def as_number(value) -> float | None:
@@ -158,19 +170,56 @@ def context_segment(data: dict) -> str:
 
 
 # --- Transcript scan (single incremental pass with an offset cache) ---
+#
+# A session's usage lives in the MAIN transcript plus separate JSONL files for
+# subagents/workflows under <transcript-dir>/<session-id>/. All are scanned and
+# cached per file; cost is priced per entry from message.model.
 
-def empty_stats() -> dict:
+def family_rates(model: str) -> tuple:
+    for key, rates in BASE_RATES.items():
+        if key in model:
+            return rates
+    return DEFAULT_RATE
+
+
+def model_rates(model_id, default: tuple) -> tuple:
+    if isinstance(model_id, str):
+        mid = model_id.lower()
+        for key, rates in MODEL_RATES:
+            if key in mid:
+                return rates
+    return default
+
+
+def usage_cost(usage: list[int], rates: tuple) -> float:
+    input_rate, output_rate = rates
+    return (
+        usage[0] * input_rate
+        + usage[1] * input_rate * 1.25
+        + usage[2] * input_rate * 0.1
+        + usage[3] * output_rate
+    ) / 1_000_000
+
+
+def empty_file_state() -> dict:
     return {
-        "v": CACHE_VERSION,
         "offset": 0,
+        "fp": [0, 0],  # (st_ino, st_dev) — detects file replaced at the same path
         "in": 0,
         "cc": 0,
         "cr": 0,
         "out": 0,
-        "fp": [0, 0],  # (st_ino, st_dev) — detects file replaced at the same path
+        "usd": 0.0,
         "recent": {},  # message.id -> last usage [in, cc, cr, out], FIFO-bounded
-        "last_task": "",
     }
+
+
+def empty_session_stats() -> dict:
+    return {"v": CACHE_VERSION, "files": {}, "last_task": ""}
+
+
+def empty_totals() -> dict:
+    return {"in": 0, "cc": 0, "cr": 0, "out": 0, "usd": 0.0, "last_task": ""}
 
 
 def stats_cache_path(transcript_path: str) -> str:
@@ -185,28 +234,27 @@ def is_count(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def load_stats_cache(cache_file: str) -> dict:
-    """Load and fully validate the cache; any malformed field → fresh stats.
+def valid_file_state(state) -> dict | None:
+    """Strictly validate one cached file state; None on any malformed field.
 
     Strict per-key validation matters: a cache that passes a partial check but
     breaks later in the scan would never be overwritten, bricking the line.
     """
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            cache = json.load(f)
-    except Exception:
-        return empty_stats()
-    stats = empty_stats()
-    if not isinstance(cache, dict) or cache.get("v") != CACHE_VERSION:
-        return stats
+    if not isinstance(state, dict):
+        return None
+    out = empty_file_state()
     for key in ("offset",) + USAGE_KEYS:
-        if not is_count(cache.get(key)):
-            return empty_stats()
-        stats[key] = cache[key]
-    fp = cache.get("fp")
+        if not is_count(state.get(key)):
+            return None
+        out[key] = state[key]
+    usd = state.get("usd")
+    if isinstance(usd, bool) or not isinstance(usd, (int, float)) or not math.isfinite(usd):
+        return None
+    out["usd"] = float(usd)
+    fp = state.get("fp")
     if isinstance(fp, list) and len(fp) == 2 and all(is_count(v) for v in fp):
-        stats["fp"] = fp
-    recent = cache.get("recent")
+        out["fp"] = fp
+    recent = state.get("recent")
     if isinstance(recent, dict):
         for mid, usage in recent.items():
             if (
@@ -215,7 +263,27 @@ def load_stats_cache(cache_file: str) -> dict:
                 and len(usage) == 4
                 and all(is_count(v) for v in usage)
             ):
-                stats["recent"][mid] = usage
+                out["recent"][mid] = usage
+    return out
+
+
+def load_session_cache(cache_file: str) -> dict:
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return empty_session_stats()
+    stats = empty_session_stats()
+    if not isinstance(cache, dict) or cache.get("v") != CACHE_VERSION:
+        return stats
+    files = cache.get("files")
+    if isinstance(files, dict):
+        for path, state in files.items():
+            if not isinstance(path, str):
+                continue
+            valid = valid_file_state(state)
+            if valid is not None:
+                stats["files"][path] = valid
     if isinstance(cache.get("last_task"), str):
         stats["last_task"] = cache["last_task"]
     return stats
@@ -246,29 +314,34 @@ def extract_usage(message: dict) -> list[int] | None:
     ]
 
 
-def accumulate_entry(stats: dict, line: bytes, entry: dict) -> None:
+def accumulate_entry(
+    state: dict, line: bytes, entry: dict, default_rates: tuple, session: dict, track_task: bool
+) -> None:
     message = entry.get("message")
     if not isinstance(message, dict):
         return
     usage = extract_usage(message)
     if usage is not None:
+        rates = model_rates(message.get("model"), default_rates)
         mid = message.get("id")
-        recent = stats["recent"]
+        recent = state["recent"]
         prev = recent.get(mid) if isinstance(mid, str) else None
         if prev is not None:
             # Same streamed response on another JSONL line: each line repeats
             # (possibly updated) usage, so replace — last line wins.
             for i, key in enumerate(USAGE_KEYS):
-                stats[key] += usage[i] - prev[i]
+                state[key] += usage[i] - prev[i]
+            state["usd"] += usage_cost(usage, rates) - usage_cost(prev, rates)
             recent[mid] = usage
         else:
             for i, key in enumerate(USAGE_KEYS):
-                stats[key] += usage[i]
+                state[key] += usage[i]
+            state["usd"] += usage_cost(usage, rates)
             if isinstance(mid, str) and mid:
                 if len(recent) >= RECENT_IDS_MAX:
                     recent.pop(next(iter(recent)))
                 recent[mid] = usage
-    if b'"Task"' in line:
+    if track_task and b'"Task"' in line:
         content = message.get("content")
         if not isinstance(content, list):
             return
@@ -281,32 +354,32 @@ def accumulate_entry(stats: dict, line: bytes, entry: dict) -> None:
                 block_input = block.get("input")
                 desc = block_input.get("description") if isinstance(block_input, dict) else None
                 if isinstance(desc, str) and desc:
-                    stats["last_task"] = desc
+                    session["last_task"] = desc
 
 
-def scan_transcript(transcript_path: str) -> dict:
-    """Cumulative usage (deduplicated by message.id) + last Task description.
-
-    The transcript is append-only JSONL, so completed work is cached by byte
-    offset and only appended lines are parsed on subsequent renders.
-    """
-    cache_file = stats_cache_path(transcript_path)
-    stats = load_stats_cache(cache_file)
+def scan_file(
+    path: str, state: dict, default_rates: tuple, session: dict, track_task: bool
+) -> bool:
+    """Incrementally scan one append-only JSONL file; True if state changed."""
     try:
-        st = os.stat(transcript_path)
+        st = os.stat(path)
     except OSError:
-        return empty_stats()
+        return False
     fp = [int(getattr(st, "st_ino", 0) or 0), int(getattr(st, "st_dev", 0) or 0)]
-    if stats["fp"] != fp or st.st_size < stats["offset"]:
+    changed = False
+    if state["fp"] != fp or st.st_size < state["offset"]:
         # New inode at the same path or truncation — cached offsets are invalid
-        stats = empty_stats()
-        stats["fp"] = fp
-    if st.st_size == stats["offset"]:
-        return stats
+        fresh = empty_file_state()
+        fresh["fp"] = fp
+        state.clear()
+        state.update(fresh)
+        changed = True
+    if st.st_size == state["offset"]:
+        return changed
     try:
-        with open(transcript_path, "rb") as f:
-            f.seek(stats["offset"])
-            offset = stats["offset"]
+        with open(path, "rb") as f:
+            f.seek(state["offset"])
+            offset = state["offset"]
             for line in f:
                 if not line.endswith(b"\n"):
                     break  # partial trailing write — picked up on the next render
@@ -320,31 +393,65 @@ def scan_transcript(transcript_path: str) -> dict:
                     continue
                 if isinstance(entry, dict) and entry.get("type") == "assistant":
                     try:
-                        accumulate_entry(stats, line, entry)
+                        accumulate_entry(state, line, entry, default_rates, session, track_task)
                     except Exception:
                         continue  # one poison line must not stall the offset cache
-        stats["offset"] = offset
-        save_stats_cache(cache_file, stats)
+        if offset != state["offset"]:
+            state["offset"] = offset
+            changed = True
     except OSError:
         pass
-    return stats
+    return changed
+
+
+def subagent_files(transcript_path: str) -> list[str]:
+    """JSONL transcripts of subagents/workflows: <transcript-dir>/<session-id>/**."""
+    session_dir = os.path.splitext(transcript_path)[0]
+    if not os.path.isdir(session_dir):
+        return []
+    found = []
+    try:
+        for root, _dirs, names in os.walk(session_dir):
+            for name in names:
+                if name.endswith(".jsonl"):
+                    found.append(os.path.join(root, name))
+    except OSError:
+        pass
+    return sorted(found)
+
+
+def scan_session(transcript_path: str, default_rates: tuple) -> dict:
+    """Aggregate usage and cost over the main transcript and all subagent files.
+
+    States for files that vanished are kept — their cost was incurred. Only the
+    main transcript feeds the task label.
+    """
+    cache_file = stats_cache_path(transcript_path)
+    session = load_session_cache(cache_file)
+    changed = False
+    for path in [transcript_path] + subagent_files(transcript_path):
+        state = session["files"].get(path)
+        if state is None:
+            state = empty_file_state()
+            session["files"][path] = state
+        changed |= scan_file(
+            path, state, default_rates, session, track_task=(path == transcript_path)
+        )
+    if changed:
+        save_stats_cache(cache_file, session)
+    totals = empty_totals()
+    for state in session["files"].values():
+        for key in USAGE_KEYS:
+            totals[key] += state[key]
+        totals["usd"] += state["usd"]
+    totals["last_task"] = session["last_task"]
+    return totals
 
 
 # --- Cost ---
 
-def cost_segment(data: dict, model: str, stats: dict) -> str:
-    input_rate, output_rate = DEFAULT_RATE
-    for key, rates in BASE_RATES.items():
-        if key in model:
-            input_rate, output_rate = rates
-            break
-    cost = (
-        stats["in"] * input_rate
-        + stats["cc"] * input_rate * 1.25
-        + stats["cr"] * input_rate * 0.1
-        + stats["out"] * output_rate
-    ) / 1_000_000
-
+def cost_segment(data: dict, stats: dict) -> str:
+    cost = stats["usd"]
     cost_obj = data.get("cost")
     official = duration_ms = None
     if isinstance(cost_obj, dict):
@@ -533,14 +640,14 @@ def build_line(data: dict) -> str:
         transcript_path = ""
 
     if transcript_path and os.path.isfile(transcript_path):
-        stats = scan_transcript(transcript_path)
+        stats = scan_session(transcript_path, family_rates(model))
     else:
-        stats = empty_stats()
+        stats = empty_totals()
 
     return (
         f"{context_segment(data)}"
         f" | {MAGENTA}{duration_segment(data, transcript_path)}{RESET}"
-        f" | {YELLOW}{cost_segment(data, model, stats)}{RESET}"
+        f" | {YELLOW}{cost_segment(data, stats)}{RESET}"
         f" | {BLUE}{model}{RESET}"
         f" | {CYAN}{tokens_segment(stats)}{RESET}"
         f"{lines_segment(data)}"
