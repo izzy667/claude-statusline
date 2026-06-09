@@ -12,6 +12,9 @@ import json
 import math
 import os
 import sys
+import time
+
+START_TIME = time.perf_counter()  # for the trailing render-time segment
 
 RESET = "\033[0m"
 RED = "\033[0;31m"
@@ -501,8 +504,6 @@ def format_remaining(resets_at) -> str:
     resets = as_number(resets_at)
     if not resets:
         return ""
-    import time
-
     remaining = int(resets - time.time())
     if remaining <= 0:
         return ""
@@ -542,8 +543,6 @@ def duration_segment(data: dict, transcript_path: str) -> str:
         start_time = get_file_creation_time(transcript_path)
         if start_time <= 0:
             return "0m"
-        import time
-
         duration = int(time.time() - start_time)
     else:
         return "0m"
@@ -696,6 +695,9 @@ def main() -> None:
             line = model_segment(data)
         except Exception:
             line = ""
+    if line:
+        elapsed_ms = (time.perf_counter() - START_TIME) * 1000
+        line += f" | {GRAY}{elapsed_ms:.0f}ms{RESET}"
     safe_print(line)
 
 
