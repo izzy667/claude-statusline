@@ -667,7 +667,31 @@ def git_segment(cwd: str) -> str:
             dirty += f" -{deleted}"
     else:
         dirty = " ○"
-    return f" | {CYAN}{branch}{dirty}{RESET}"
+    return f" | {CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env)}"
+
+
+def workspace_diff(cwd: str, env: dict) -> str:
+    """Uncommitted line delta vs HEAD (staged + unstaged) — zeroes after commit."""
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            ["git", "-c", "core.fileMode=false", "diff", "--numstat", "HEAD"],
+            cwd=cwd, stderr=subprocess.DEVNULL, text=True, timeout=1.5, env=env,
+        )
+    except Exception:
+        return ""  # e.g. repo without commits yet, or git timed out
+    added = removed = 0
+    for diff_line in out.splitlines():
+        parts = diff_line.split("\t")
+        if len(parts) >= 2:  # binary files report "-" instead of counts
+            if parts[0].isdigit():
+                added += int(parts[0])
+            if parts[1].isdigit():
+                removed += int(parts[1])
+    if added == 0 and removed == 0:
+        return ""
+    return f" ({GREEN}+{added}{RESET}/{RED}-{removed}{RESET})"
 
 
 # --- Task label ---
