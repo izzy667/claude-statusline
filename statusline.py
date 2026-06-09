@@ -13,6 +13,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime
 
 START_TIME = time.perf_counter()  # for the trailing render-time segment
 
@@ -52,7 +53,7 @@ DEFAULT_RATE = (3, 15)
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
 # Bump on schema OR pricing changes — cached usd values depend on the rate tables
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_MS = 300_000  # hide burn rate for sessions under 5 minutes (too noisy)
 RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
@@ -73,6 +74,16 @@ def as_number(value) -> float | None:
     except (ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
+
+
+def parse_ts(value) -> float:
+    """ISO-8601 transcript timestamp → epoch seconds; 0.0 when unparsable."""
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 def format_tokens(tokens: int) -> str:
@@ -214,6 +225,10 @@ def empty_file_state() -> dict:
         "out": 0,
         "usd": 0.0,
         "recent": {},  # message.id -> last usage [in, cc, cr, out], FIFO-bounded
+        # AI working-time (wall-clock the user actually waited), main file only:
+        "wait_s": 0.0,  # closed turns: sum of (last assistant ts - user prompt ts)
+        "turn_start": 0.0,  # timestamp of the user prompt opening the current turn
+        "last_ai": 0.0,  # timestamp of the newest assistant entry in that turn
     }
 
 
@@ -222,7 +237,7 @@ def empty_session_stats() -> dict:
 
 
 def empty_totals() -> dict:
-    return {"in": 0, "cc": 0, "cr": 0, "out": 0, "usd": 0.0, "last_task": ""}
+    return {"in": 0, "cc": 0, "cr": 0, "out": 0, "usd": 0.0, "ai_s": 0, "last_task": ""}
 
 
 def stats_cache_path(transcript_path: str) -> str:
@@ -250,10 +265,11 @@ def valid_file_state(state) -> dict | None:
         if not is_count(state.get(key)):
             return None
         out[key] = state[key]
-    usd = state.get("usd")
-    if isinstance(usd, bool) or not isinstance(usd, (int, float)) or not math.isfinite(usd):
-        return None
-    out["usd"] = float(usd)
+    for key in ("usd", "wait_s", "turn_start", "last_ai"):
+        val = state.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
+            return None
+        out[key] = float(val)
     fp = state.get("fp")
     if isinstance(fp, list) and len(fp) == 2 and all(is_count(v) for v in fp):
         out["fp"] = fp
@@ -318,7 +334,7 @@ def extract_usage(message: dict) -> list[int] | None:
 
 
 def accumulate_entry(
-    state: dict, line: bytes, entry: dict, default_rates: tuple, session: dict, track_task: bool
+    state: dict, line: bytes, entry: dict, default_rates: tuple, session: dict, is_main: bool
 ) -> None:
     message = entry.get("message")
     if not isinstance(message, dict):
@@ -344,7 +360,7 @@ def accumulate_entry(
                 if len(recent) >= RECENT_IDS_MAX:
                     recent.pop(next(iter(recent)))
                 recent[mid] = usage
-    if track_task and b'"Task"' in line:
+    if is_main and b'"Task"' in line:
         content = message.get("content")
         if not isinstance(content, list):
             return
@@ -361,7 +377,7 @@ def accumulate_entry(
 
 
 def scan_file(
-    path: str, state: dict, default_rates: tuple, session: dict, track_task: bool
+    path: str, state: dict, default_rates: tuple, session: dict, is_main: bool
 ) -> bool:
     """Incrementally scan one append-only JSONL file; True if state changed."""
     try:
@@ -387,16 +403,36 @@ def scan_file(
                 if not line.endswith(b"\n"):
                     break  # partial trailing write — picked up on the next render
                 offset += len(line)
-                # Cheap byte prefilter: only assistant entries carry usage/tool_use
-                if b'"assistant"' not in line:
+                # Cheap byte prefilters; tool results always carry "toolUseResult"
+                user_candidate = (
+                    is_main
+                    and (b'"type":"user"' in line or b'"type": "user"' in line)
+                    and b'"toolUseResult"' not in line
+                )
+                if not user_candidate and b'"assistant"' not in line:
                     continue
                 try:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, RecursionError):
                     continue
-                if isinstance(entry, dict) and entry.get("type") == "assistant":
+                if not isinstance(entry, dict):
+                    continue
+                etype = entry.get("type")
+                if etype == "user" and user_candidate and not entry.get("isMeta"):
+                    # Real user prompt: close the previous AI turn, open a new one
+                    ts = parse_ts(entry.get("timestamp"))
+                    if ts > 0:
+                        if state["turn_start"] > 0 and state["last_ai"] > state["turn_start"]:
+                            state["wait_s"] += state["last_ai"] - state["turn_start"]
+                        state["turn_start"] = ts
+                        state["last_ai"] = 0.0
+                elif etype == "assistant":
+                    if is_main and state["turn_start"] > 0:
+                        ts = parse_ts(entry.get("timestamp"))
+                        if ts > state["last_ai"]:
+                            state["last_ai"] = ts
                     try:
-                        accumulate_entry(state, line, entry, default_rates, session, track_task)
+                        accumulate_entry(state, line, entry, default_rates, session, is_main)
                     except Exception:
                         continue  # one poison line must not stall the offset cache
         if offset != state["offset"]:
@@ -438,7 +474,7 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
             state = empty_file_state()
             session["files"][path] = state
         changed |= scan_file(
-            path, state, default_rates, session, track_task=(path == transcript_path)
+            path, state, default_rates, session, is_main=(path == transcript_path)
         )
     if changed:
         save_stats_cache(cache_file, session)
@@ -447,6 +483,12 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
         for key in USAGE_KEYS:
             totals[key] += state[key]
         totals["usd"] += state["usd"]
+    main_state = session["files"].get(transcript_path)
+    if main_state is not None:
+        wait = main_state["wait_s"]
+        if main_state["turn_start"] > 0 and main_state["last_ai"] > main_state["turn_start"]:
+            wait += main_state["last_ai"] - main_state["turn_start"]  # turn in progress
+        totals["ai_s"] = int(wait)
     totals["last_task"] = session["last_task"]
     return totals
 
@@ -533,22 +575,29 @@ def rate_limits_segment(data: dict) -> str:
 
 # --- Session duration ---
 
-def duration_segment(data: dict, transcript_path: str) -> str:
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours}h{minutes}m" if hours > 0 else f"{minutes}m"
+
+
+def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
     # Payload duration survives resumed sessions; file birthtime is the fallback
     cost_obj = data.get("cost")
     ms = as_number(cost_obj.get("total_duration_ms")) if isinstance(cost_obj, dict) else None
     if ms and ms > 0:
-        duration = int(ms // 1000)
+        elapsed = format_duration(int(ms // 1000))
     elif transcript_path and os.path.isfile(transcript_path):
         start_time = get_file_creation_time(transcript_path)
-        if start_time <= 0:
-            return "0m"
-        duration = int(time.time() - start_time)
+        elapsed = format_duration(int(time.time() - start_time)) if start_time > 0 else "0m"
     else:
-        return "0m"
-    hours, remainder = divmod(duration, 3600)
-    minutes = remainder // 60
-    return f"{hours}h{minutes}m" if hours > 0 else f"{minutes}m"
+        elapsed = "0m"
+    if stats["ai_s"] > 0:
+        # In parentheses: wall-clock the user actually waited for responses
+        # (sum of user-prompt → last-assistant-entry spans from the transcript;
+        # NOT total_api_duration_ms, which multiply-counts parallel subagents)
+        elapsed += f" ({format_duration(stats['ai_s'])})"
+    return elapsed
 
 
 # --- Git ---
@@ -645,7 +694,7 @@ def build_line(data: dict) -> str:
 
     return (
         f"{context_segment(data)}"
-        f" | {MAGENTA}{duration_segment(data, transcript_path)}{RESET}"
+        f" | {MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}"
         f" | {YELLOW}{cost_segment(data, stats)}{RESET}"
         f" | {BLUE}{model}{RESET}"
         f" | {CYAN}{tokens_segment(stats)}{RESET}"
