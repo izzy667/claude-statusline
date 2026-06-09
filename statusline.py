@@ -125,7 +125,12 @@ def main() -> None:
 
     # --- Theoretical API cost (per million tokens) ---
     # Base rates: (input, output); cache: write=1.25x input, read=0.1x input
+    # Verified against platform.claude.com pricing, 2026-06.
+    # More specific keys first — "Opus 4.1" must win over "Opus".
     base_rates = {
+        "Opus 4.1": (15, 75),  # deprecated, retires 2026-08-05
+        "Fable": (10, 50),
+        "Mythos": (10, 50),
         "Opus": (5, 25),
         "Sonnet": (3, 15),
         "Haiku": (1, 5),
