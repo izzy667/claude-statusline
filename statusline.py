@@ -53,7 +53,8 @@ DEFAULT_RATE = (3, 15)
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
 # Bump on schema OR pricing changes — cached usd values depend on the rate tables
-CACHE_VERSION = 5
+CACHE_VERSION = 7
+WEB_SEARCH_USD = 0.01  # $10 per 1000 searches
 USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_S = 300  # hide burn rate for sessions under 5 minutes (too noisy)
 IDLE_GAP_S = 3600  # response→next-prompt breaks longer than this don't count as session time
@@ -207,13 +208,18 @@ def model_rates(model_id, default: tuple) -> tuple:
 
 
 def usage_cost(usage: list[int], rates: tuple) -> float:
+    # usage: [in, cache_create_total, cache_read, out, cache_create_1h, web_searches]
+    # 5-minute cache writes cost 1.25x input rate, 1-hour writes 2x
     input_rate, output_rate = rates
+    cc_1h = usage[4]
+    cc_5m = usage[1] - cc_1h
     return (
         usage[0] * input_rate
-        + usage[1] * input_rate * 1.25
+        + cc_5m * input_rate * 1.25
+        + cc_1h * input_rate * 2.0
         + usage[2] * input_rate * 0.1
         + usage[3] * output_rate
-    ) / 1_000_000
+    ) / 1_000_000 + usage[5] * WEB_SEARCH_USD
 
 
 def empty_file_state() -> dict:
@@ -294,7 +300,7 @@ def valid_file_state(state) -> dict | None:
             if (
                 isinstance(mid, str)
                 and isinstance(usage, list)
-                and len(usage) == 4
+                and len(usage) == 6
                 and all(is_count(v) for v in usage)
             ):
                 out["recent"][mid] = usage
@@ -333,11 +339,8 @@ def save_stats_cache(cache_file: str, stats: dict) -> None:
         pass
 
 
-def extract_usage(message: dict) -> list[int] | None:
-    u = message.get("usage")
-    if not isinstance(u, dict):
-        return None
-    return [
+def extract_usage(u: dict) -> list[int]:
+    usage = [
         int(as_number(u.get(key)) or 0)
         for key in (
             "input_tokens",
@@ -346,6 +349,40 @@ def extract_usage(message: dict) -> list[int] | None:
             "output_tokens",
         )
     ]
+    # 1h cache writes are priced differently; without the breakdown assume 5m.
+    # The breakdown sometimes exceeds the legacy total field — trust the larger.
+    breakdown = u.get("cache_creation")
+    cc_1h = 0
+    if isinstance(breakdown, dict):
+        cc_5m = int(as_number(breakdown.get("ephemeral_5m_input_tokens")) or 0)
+        cc_1h = int(as_number(breakdown.get("ephemeral_1h_input_tokens")) or 0)
+        usage[1] = max(usage[1], cc_5m + cc_1h)
+        cc_1h = min(cc_1h, usage[1])
+    usage.append(cc_1h)
+    server_tools = u.get("server_tool_use")
+    searches = 0
+    if isinstance(server_tools, dict):
+        searches = int(as_number(server_tools.get("web_search_requests")) or 0)
+    usage.append(searches)
+    return usage
+
+
+def iterations_cost(u: dict, default_rates: tuple) -> float:
+    """Billed earlier attempts (e.g. model fallback) recorded only in usage.iterations.
+
+    The top-level usage equals the LAST iteration; previous ones were separate
+    billed calls, often on a different (more expensive) model.
+    """
+    iterations = u.get("iterations")
+    if not isinstance(iterations, list) or len(iterations) < 2:
+        return 0.0
+    extra = 0.0
+    for attempt in iterations[:-1]:
+        if isinstance(attempt, dict):
+            extra += usage_cost(
+                extract_usage(attempt), model_rates(attempt.get("model"), default_rates)
+            )
+    return extra
 
 
 def accumulate_entry(
@@ -354,15 +391,17 @@ def accumulate_entry(
     message = entry.get("message")
     if not isinstance(message, dict):
         return
-    usage = extract_usage(message)
-    if usage is not None:
+    u = message.get("usage")
+    if isinstance(u, dict):
+        usage = extract_usage(u)
         rates = model_rates(message.get("model"), default_rates)
         mid = message.get("id")
         recent = state["recent"]
         prev = recent.get(mid) if isinstance(mid, str) else None
         if prev is not None:
             # Same streamed response on another JSONL line: each line repeats
-            # (possibly updated) usage, so replace — last line wins.
+            # (possibly updated) usage, so replace — last line wins. Duplicate
+            # lines repeat identical iterations, so those are not re-added.
             for i, key in enumerate(USAGE_KEYS):
                 state[key] += usage[i] - prev[i]
             state["usd"] += usage_cost(usage, rates) - usage_cost(prev, rates)
@@ -370,7 +409,7 @@ def accumulate_entry(
         else:
             for i, key in enumerate(USAGE_KEYS):
                 state[key] += usage[i]
-            state["usd"] += usage_cost(usage, rates)
+            state["usd"] += usage_cost(usage, rates) + iterations_cost(u, default_rates)
             if isinstance(mid, str) and mid:
                 if len(recent) >= RECENT_IDS_MAX:
                     recent.pop(next(iter(recent)))
