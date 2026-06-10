@@ -53,9 +53,10 @@ DEFAULT_RATE = (3, 15)
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
 # Bump on schema OR pricing changes — cached usd values depend on the rate tables
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 USAGE_KEYS = ("in", "cc", "cr", "out")
-BURN_RATE_MIN_MS = 300_000  # hide burn rate for sessions under 5 minutes (too noisy)
+BURN_RATE_MIN_S = 300  # hide burn rate for sessions under 5 minutes (too noisy)
+IDLE_GAP_S = 3600  # response→next-prompt breaks longer than this don't count as session time
 RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
 
 
@@ -225,10 +226,14 @@ def empty_file_state() -> dict:
         "out": 0,
         "usd": 0.0,
         "recent": {},  # message.id -> last usage [in, cc, cr, out], FIFO-bounded
-        # AI working-time (wall-clock the user actually waited), main file only:
-        "wait_s": 0.0,  # closed turns: sum of (last assistant ts - user prompt ts)
-        "turn_start": 0.0,  # timestamp of the user prompt opening the current turn
-        "last_ai": 0.0,  # timestamp of the newest assistant entry in that turn
+        # Event-walk times (main file only): gaps between consecutive events
+        # (real user prompt / assistant entry) longer than IDLE_GAP_S are breaks
+        # and count nowhere; shorter ones count as session time, and as waiting
+        # time too when they end in an assistant entry after a prompt.
+        "wait_s": 0.0,
+        "active_s": 0.0,
+        "last_event": 0.0,  # timestamp of the newest counted event
+        "turn_open": 0.0,  # 1.0 once any prompt was seen (gap→wait attribution)
     }
 
 
@@ -237,7 +242,17 @@ def empty_session_stats() -> dict:
 
 
 def empty_totals() -> dict:
-    return {"in": 0, "cc": 0, "cr": 0, "out": 0, "usd": 0.0, "ai_s": 0, "last_task": ""}
+    return {
+        "in": 0,
+        "cc": 0,
+        "cr": 0,
+        "out": 0,
+        "usd": 0.0,
+        "ai_s": 0,
+        "active_s": 0,
+        "last_activity": 0.0,
+        "last_task": "",
+    }
 
 
 def stats_cache_path(transcript_path: str) -> str:
@@ -265,7 +280,7 @@ def valid_file_state(state) -> dict | None:
         if not is_count(state.get(key)):
             return None
         out[key] = state[key]
-    for key in ("usd", "wait_s", "turn_start", "last_ai"):
+    for key in ("usd", "wait_s", "active_s", "last_event", "turn_open"):
         val = state.get(key)
         if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
             return None
@@ -419,18 +434,27 @@ def scan_file(
                     continue
                 etype = entry.get("type")
                 if etype == "user" and user_candidate and not entry.get("isMeta"):
-                    # Real user prompt: close the previous AI turn, open a new one
+                    # Real user prompt: gap since the last event is the user's
+                    # think time — session time when short, a break when long
                     ts = parse_ts(entry.get("timestamp"))
                     if ts > 0:
-                        if state["turn_start"] > 0 and state["last_ai"] > state["turn_start"]:
-                            state["wait_s"] += state["last_ai"] - state["turn_start"]
-                        state["turn_start"] = ts
-                        state["last_ai"] = 0.0
+                        gap = ts - state["last_event"]
+                        if state["last_event"] > 0 and 0 < gap <= IDLE_GAP_S:
+                            state["active_s"] += gap
+                        state["last_event"] = max(state["last_event"], ts)
+                        state["turn_open"] = 1.0
                 elif etype == "assistant":
-                    if is_main and state["turn_start"] > 0:
+                    if is_main:
+                        # Gap ending in an assistant entry is AI working time;
+                        # over the threshold it's a stall/resume break instead
                         ts = parse_ts(entry.get("timestamp"))
-                        if ts > state["last_ai"]:
-                            state["last_ai"] = ts
+                        if ts > 0:
+                            gap = ts - state["last_event"]
+                            if state["last_event"] > 0 and 0 < gap <= IDLE_GAP_S:
+                                state["active_s"] += gap
+                                if state["turn_open"] > 0:
+                                    state["wait_s"] += gap
+                            state["last_event"] = max(state["last_event"], ts)
                     try:
                         accumulate_entry(state, line, entry, default_rates, session, is_main)
                     except Exception:
@@ -485,10 +509,9 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
         totals["usd"] += state["usd"]
     main_state = session["files"].get(transcript_path)
     if main_state is not None:
-        wait = main_state["wait_s"]
-        if main_state["turn_start"] > 0 and main_state["last_ai"] > main_state["turn_start"]:
-            wait += main_state["last_ai"] - main_state["turn_start"]  # turn in progress
-        totals["ai_s"] = int(wait)
+        totals["ai_s"] = int(main_state["wait_s"])
+        totals["active_s"] = int(main_state["active_s"])
+        totals["last_activity"] = main_state["last_event"]
     totals["last_task"] = session["last_task"]
     return totals
 
@@ -510,8 +533,13 @@ def cost_segment(data: dict, stats: dict) -> str:
 
     burn = ""
     burn_base = official if official is not None else (cost if cost > 0 else None)
-    if burn_base is not None and duration_ms and duration_ms >= BURN_RATE_MIN_MS:
-        burn = f" {format_money(burn_base / (duration_ms / 3_600_000))}/h"
+    # $ per hour of ACTIVE session time (breaks >1h excluded), so a long idle
+    # gap doesn't dilute the rate; payload wall duration is the fallback
+    active = active_session_time(stats)
+    if active is None and duration_ms and duration_ms > 0:
+        active = duration_ms / 1000
+    if burn_base is not None and active and active >= BURN_RATE_MIN_S:
+        burn = f" {format_money(burn_base / (active / 3600))}/h"
 
     if official is not None:
         return f"~${cost:.2f} ({format_money(official)}{burn})"
@@ -586,17 +614,37 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{minutes}m" if hours > 0 else f"{minutes}m"
 
 
+def active_session_time(stats: dict) -> int | None:
+    """Transcript-derived session time minus idle breaks over IDLE_GAP_S.
+
+    Counts turn spans plus inter-turn gaps up to the threshold; the time since
+    the last activity ticks live and stops counting once it exceeds the gap.
+    Returns None when the transcript yielded no turn data.
+    """
+    if stats["last_activity"] <= 0:
+        return None
+    active = stats["active_s"]
+    tail = time.time() - stats["last_activity"]
+    if 0 < tail <= IDLE_GAP_S:
+        active += int(tail)
+    return active
+
+
 def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
-    # Payload duration survives resumed sessions; file birthtime is the fallback
-    cost_obj = data.get("cost")
-    ms = as_number(cost_obj.get("total_duration_ms")) if isinstance(cost_obj, dict) else None
-    if ms and ms > 0:
-        elapsed = format_duration(int(ms // 1000))
-    elif transcript_path and os.path.isfile(transcript_path):
-        start_time = get_file_creation_time(transcript_path)
-        elapsed = format_duration(int(time.time() - start_time)) if start_time > 0 else "0m"
-    else:
-        elapsed = "0m"
+    seconds = active_session_time(stats)
+    if seconds is None:
+        # Fallbacks when the transcript has no turn data: payload wall duration
+        # (survives resumed sessions), then transcript file birthtime
+        cost_obj = data.get("cost")
+        ms = as_number(cost_obj.get("total_duration_ms")) if isinstance(cost_obj, dict) else None
+        if ms and ms > 0:
+            seconds = int(ms // 1000)
+        elif transcript_path and os.path.isfile(transcript_path):
+            start_time = get_file_creation_time(transcript_path)
+            seconds = int(time.time() - start_time) if start_time > 0 else 0
+        else:
+            seconds = 0
+    elapsed = format_duration(seconds)
     if stats["ai_s"] > 0:
         # In parentheses: wall-clock the user actually waited for responses
         # (sum of user-prompt → last-assistant-entry spans from the transcript;
