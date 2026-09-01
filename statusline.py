@@ -65,6 +65,7 @@ USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_S = 300  # hide burn rate for sessions under 5 minutes (too noisy)
 IDLE_GAP_S = 3600  # response→next-prompt breaks longer than this don't count as session time
 RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
+WAIT_MARK = "⧗ "  # marks the waiting time so two clocks side by side stay readable
 MODEL_MIX_MAX = 2  # extra model families shown next to the main-loop model
 MODEL_MIX_MIN_PCT = 1  # below this share of session cost a family is noise
 
@@ -1016,7 +1017,7 @@ def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
         # In parentheses: wall-clock the user actually waited for responses
         # (sum of user-prompt → last-assistant-entry spans from the transcript;
         # NOT total_api_duration_ms, which multiply-counts parallel subagents)
-        elapsed += f" ({format_duration(stats['ai_s'])})"
+        elapsed += f" ({WAIT_MARK}{format_duration(stats['ai_s'])})"
     return elapsed
 
 
