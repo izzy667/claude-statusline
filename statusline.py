@@ -182,6 +182,15 @@ def model_segment(data: dict) -> str:
     return model
 
 
+def estimates_enabled() -> bool:
+    """Own price-table estimates are opt-in — STATUSLINE_ESTIMATE_USAGE=1.
+
+    Off by default the line carries only figures Claude Code itself reports, so
+    nothing shown can drift from real billing when the rate tables age.
+    """
+    return os.environ.get("STATUSLINE_ESTIMATE_USAGE") == "1"
+
+
 def model_mix_segment(current: str, stats: dict) -> str:
     """Cost share of families the main loop is NOT running on.
 
@@ -190,7 +199,7 @@ def model_mix_segment(current: str, stats: dict) -> str:
     main-loop model, so that spend is otherwise invisible.
     """
     total = stats["usd"]
-    if total <= 0:
+    if total <= 0 or not estimates_enabled():
         return ""
     others = sorted(
         ((label, usd) for label, usd in stats["models"].items() if label != current),
@@ -629,26 +638,36 @@ def format_money(value: float) -> str:
 
 
 def cost_segment(data: dict, stats: dict) -> str:
-    cost = stats["usd"]
+    """Official session cost plus burn rate; the own estimate only when opted in.
+
+    "n/a" holds the slot until the first API response puts cost in the payload —
+    a segment that vanishes mid-session shifts every field after it.
+    """
     cost_obj = data.get("cost")
     official = duration_ms = None
     if isinstance(cost_obj, dict):
         official = as_number(cost_obj.get("total_cost_usd"))
         duration_ms = as_number(cost_obj.get("total_duration_ms"))
+    estimate = stats["usd"] if estimates_enabled() else None
 
     burn = ""
-    burn_base = official if official is not None else (cost if cost > 0 else None)
+    burn_base = official if official is not None else (estimate if estimate else None)
     # $ per hour of ACTIVE session time (breaks >1h excluded), so a long idle
     # gap doesn't dilute the rate; payload wall duration is the fallback
     active = active_session_time(stats)
     if active is None and duration_ms and duration_ms > 0:
         active = duration_ms / 1000
     if burn_base is not None and active and active >= BURN_RATE_MIN_S:
-        burn = f" {format_money(burn_base / (active / 3600))}/h"
+        burn = f"{format_money(burn_base / (active / 3600))}/h"
+    tail = f" {burn}" if burn else ""
 
+    if estimate is None:
+        if official is None:
+            return "n/a"
+        return f"{format_money(official)} ({burn})" if burn else format_money(official)
     if official is not None:
-        return f"~${cost:.2f} ({format_money(official)}{burn})"
-    return f"~${cost:.2f}{burn}"
+        return f"~${estimate:.2f} ({format_money(official)}{tail})"
+    return f"~${estimate:.2f}{tail}"
 
 
 def tokens_segment(stats: dict) -> str:

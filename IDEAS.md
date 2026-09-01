@@ -17,7 +17,11 @@ modelu obok nazwy modelu (`+Fable 13%`), wycena fast mode po `usage.speed`, oraz
 tygodniowe okna per model (`F:5%`) z `GET /api/oauth/usage` — odświeżane przez
 odłączony proces (`--refresh-usage`) do wspólnego cache'u w tmpdir, TTL 10 min,
 z lockiem przeciw równoległym zapytaniom; render nigdy nie czeka na sieć,
-a `STATUSLINE_NO_USAGE_API=1` wyłącza to całkowicie.
+a `STATUSLINE_NO_USAGE_API=1` wyłącza to całkowicie. Własne szacunki kosztu
+(`~$…` oraz `+Fable 13%`) są domyślnie **wyłączone** — włącza je
+`STATUSLINE_ESTIMATE_USAGE=1`; bez niej linia pokazuje wyłącznie oficjalny
+`cost.total_cost_usd` i burn rate, czyli nic, co mogłoby się rozjechać
+z realnym rozliczeniem, gdy tabela stawek się zestarzeje.
 
 ## Do zrobienia
 
