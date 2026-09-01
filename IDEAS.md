@@ -21,7 +21,12 @@ a `STATUSLINE_NO_USAGE_API=1` wyłącza to całkowicie. Własne szacunki kosztu
 (`~$…` oraz `+Fable 13%`) są domyślnie **wyłączone** — włącza je
 `STATUSLINE_ESTIMATE_USAGE=1`; bez niej linia pokazuje wyłącznie oficjalny
 `cost.total_cost_usd` i burn rate, czyli nic, co mogłoby się rozjechać
-z realnym rozliczeniem, gdy tabela stawek się zestarzeje.
+z realnym rozliczeniem, gdy tabela stawek się zestarzeje. Kolejność bloków
+przyjmuje argument wywołania — `statusline.py "model,cost,git"` (przecinki lub
+spacje, wielkość liter bez znaczenia, duplikaty i nieznane nazwy pomijane, brak
+argumentu = kolejność domyślna). Nazwy: `context`, `duration`, `cost`, `model`,
+`tokens`, `lines`, `limits`, `git`, `task`, `render`. Blok pominięty w argumencie
+nie jest liczony — wyrzucenie `git` oszczędza dwa wywołania procesu.
 
 ## Do zrobienia
 
@@ -61,6 +66,8 @@ task → tokeny → szczegóły gita → czas. Konfiguracja przez zmienne środo
 w stylu istniejącego `STATUSLINE_DEBUG`, np. `STATUSLINE_HIDE=tokens,task`,
 `STATUSLINE_COMPACT=1` — ustawiane w bloku `env` settings.json bez edycji kodu.
 Dokumentacja wspiera też wiele linii wyjścia (tryb verbose).
+Częściowo zrobione: stała kolejność/wybór bloków jest już sterowana argumentem
+wywołania (patrz wyżej). Zostaje automat reagujący na `COLUMNS`.
 
 ### 6. Dodatkowe badge stanu — wartość: niska, nakład: mały
 Warunkowe, tylko gdy nie-domyślne: `output_style.name` (gdy != "default"),

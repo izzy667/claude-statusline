@@ -686,7 +686,7 @@ def lines_segment(data: dict) -> str:
     removed = int(as_number(cost_obj.get("total_lines_removed")) or 0)
     if added <= 0 and removed <= 0:
         return ""
-    return f" | {GREEN}+{added}{RESET}/{RED}-{removed}{RESET}"
+    return f"{GREEN}+{added}{RESET}/{RED}-{removed}{RESET}"
 
 
 # --- Model-scoped usage windows (plan usage endpoint) ---
@@ -956,7 +956,7 @@ def rate_limits_segment(data: dict) -> str:
         label = format_remaining(window.get("resets_at")) or fallback
         parts.append(f"{rate_color(pct)}{label}:{pct:.0f}%{RESET}")
     parts.extend(scoped_limit_parts())  # per-model weekly buckets (e.g. Fable)
-    return f" | {' '.join(parts)}" if parts else ""
+    return " ".join(parts)
 
 
 # --- Session duration ---
@@ -1068,7 +1068,7 @@ def git_segment(cwd: str) -> str:
             dirty += f" -{deleted}"
     else:
         dirty = " ○"
-    return f" | {CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env)}"
+    return f"{CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env)}"
 
 
 def workspace_diff(cwd: str, env: dict) -> str:
@@ -1102,12 +1102,44 @@ def task_segment(task_name: str) -> str:
         return ""
     if len(task_name) > 45:
         task_name = task_name[:42] + "..."
-    return f" - {task_name}"
+    return task_name
 
 
 # --- Assembly ---
 
-def build_line(data: dict) -> str:
+def render_segment() -> str:
+    return f"{GRAY}{(time.perf_counter() - START_TIME) * 1000:.0f}ms{RESET}"
+
+
+# Default order; also the set of names the command argument may reorder.
+BLOCK_ORDER = (
+    "context", "duration", "cost", "model", "tokens",
+    "lines", "limits", "git", "task", "render",
+)
+# "branch - task" reads as one unit, so the task block keeps the dash it had.
+BLOCK_JOINERS = {"task": " - "}
+BLOCK_SEPARATOR = " | "
+
+
+def parse_blocks(argv: list) -> tuple:
+    """Block order from the command argument, e.g. "context,cost,model git".
+
+    Comma- or space-separated, case-insensitive; unknown names are dropped so a
+    single typo cannot blank the line, and an argument with nothing usable in it
+    falls back to the default order.
+    """
+    raw = ",".join(arg for arg in argv if not arg.startswith("-"))
+    if not raw.strip():
+        return BLOCK_ORDER
+    order = []
+    for name in raw.replace(",", " ").split():
+        name = name.lower()
+        if name in BLOCK_ORDER and name not in order:
+            order.append(name)  # deduplicated: rendering git twice costs two forks
+    return tuple(order) or BLOCK_ORDER
+
+
+def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
     model = model_segment(data)
     workspace = data.get("workspace")
     cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
@@ -1123,17 +1155,33 @@ def build_line(data: dict) -> str:
     else:
         stats = empty_totals()
 
-    return (
-        f"{context_segment(data)}"
-        f" | {MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}"
-        f" | {YELLOW}{cost_segment(data, stats)}{RESET}"
-        f" | {BLUE}{model}{RESET}{GRAY}{model_mix_segment(tier[0], stats)}{RESET}"
-        f" | {CYAN}{tokens_segment(stats)}{RESET}"
-        f"{lines_segment(data)}"
-        f"{rate_limits_segment(data)}"
-        f"{git_segment(cwd) if cwd else ''}"
-        f"{task_segment(stats['last_task'])}"
-    )
+    # Lazy on purpose: a block left out of the order is never computed, so
+    # dropping "git" also drops its two subprocess calls.
+    blocks = {
+        "context": lambda: context_segment(data),
+        "duration": lambda: f"{MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}",
+        "cost": lambda: f"{YELLOW}{cost_segment(data, stats)}{RESET}",
+        "model": lambda: (
+            f"{BLUE}{model}{RESET}{GRAY}{model_mix_segment(tier[0], stats)}{RESET}"
+        ),
+        "tokens": lambda: f"{CYAN}{tokens_segment(stats)}{RESET}",
+        "lines": lambda: lines_segment(data),
+        "limits": lambda: rate_limits_segment(data),
+        "git": lambda: git_segment(cwd) if cwd else "",
+        "task": lambda: task_segment(stats["last_task"]),
+        "render": render_segment,
+    }
+
+    line = ""
+    for name in order:
+        make = blocks.get(name)
+        if make is None:
+            continue
+        text = make()
+        if not text:
+            continue
+        line += (BLOCK_JOINERS.get(name, BLOCK_SEPARATOR) if line else "") + text
+    return line
 
 
 def safe_print(line: str) -> None:
@@ -1171,16 +1219,15 @@ def main() -> None:
             pass
 
     try:
-        line = build_line(data)
+        line = build_line(data, parse_blocks(sys.argv[1:]))
     except Exception:
         # Last-resort guard: a broken payload must not break the statusline
         try:
             line = model_segment(data)
         except Exception:
             line = ""
-    if line:
-        elapsed_ms = (time.perf_counter() - START_TIME) * 1000
-        line += f" | {GRAY}{elapsed_ms:.0f}ms{RESET}"
+        if line:
+            line += f"{BLOCK_SEPARATOR}{render_segment()}"
     safe_print(line)
 
 
