@@ -25,7 +25,9 @@ z realnym rozliczeniem, gdy tabela stawek się zestarzeje. Kolejność bloków
 przyjmuje argument wywołania — `statusline.py "model,cost,git"` (przecinki lub
 spacje, wielkość liter bez znaczenia, duplikaty i nieznane nazwy pomijane, brak
 argumentu = kolejność domyślna). Nazwy: `context`, `duration`, `cost`, `model`,
-`tokens`, `lines`, `limits`, `git`, `task`, `render`. Blok pominięty w argumencie
+`tokens`, `lines`, `limits`, `git`, `task`, `render`, plus `render+time`
+(czas renderu z zegarem lokalnym w nawiasie) — dostępny tylko po jawnym podaniu,
+poza kolejnością domyślną. Blok pominięty w argumencie
 nie jest liczony — wyrzucenie `git` oszczędza dwa wywołania procesu.
 
 ## Do zrobienia

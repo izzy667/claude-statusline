@@ -170,11 +170,12 @@ def model_segment(data: dict) -> str:
     model = model_obj.get("display_name") if isinstance(model_obj, dict) else None
     if not isinstance(model, str) or not model:
         model = "Unknown"
-    # Compact context size hints: "(1M context)" → "1M"
-    for tag in ("(1M context)", "(200K context)"):
-        if tag in model:
-            model = model.replace(tag, tag[1:tag.index(" ")])
-            break
+    # Drop the "(1M context)" suffix — the context block already shows the
+    # window size, so repeating it here only costs width. Matches any size.
+    if model.endswith(" context)"):
+        cut = model.rfind(" (")
+        if cut > 0:
+            model = model[:cut]
     effort = get_effort(data)
     if effort:
         model = f"{model} E/{effort}"
@@ -1122,15 +1123,27 @@ def task_segment(task_name: str) -> str:
 
 # --- Assembly ---
 
+def elapsed_ms() -> float:
+    return (time.perf_counter() - START_TIME) * 1000
+
+
 def render_segment() -> str:
-    return f"{GRAY}{(time.perf_counter() - START_TIME) * 1000:.0f}ms{RESET}"
+    return f"{GRAY}{elapsed_ms():.0f}ms{RESET}"
 
 
-# Default order; also the set of names the command argument may reorder.
+def render_time_segment() -> str:
+    """Render cost plus the wall clock, in the machine's local time."""
+    return f"{GRAY}{elapsed_ms():.0f}ms ({time.strftime('%H:%M')}){RESET}"
+
+
+# Default order, applied when the command carries no block argument.
 BLOCK_ORDER = (
     "context", "duration", "cost", "model", "tokens",
     "lines", "limits", "git", "task", "render",
 )
+# Blocks outside the default line — available only by naming them explicitly.
+EXTRA_BLOCKS = ("render+time",)
+BLOCK_NAMES = BLOCK_ORDER + EXTRA_BLOCKS
 # "branch - task" reads as one unit, so the task block keeps the dash it had.
 BLOCK_JOINERS = {"task": " - "}
 BLOCK_SEPARATOR = " | "
@@ -1141,7 +1154,8 @@ def parse_blocks(argv: list) -> tuple:
 
     Comma- or space-separated, case-insensitive; unknown names are dropped so a
     single typo cannot blank the line, and an argument with nothing usable in it
-    falls back to the default order.
+    falls back to the default order. Names outside the default order (see
+    EXTRA_BLOCKS) are valid too — they simply have to be asked for.
     """
     raw = ",".join(arg for arg in argv if not arg.startswith("-"))
     if not raw.strip():
@@ -1149,7 +1163,7 @@ def parse_blocks(argv: list) -> tuple:
     order = []
     for name in raw.replace(",", " ").split():
         name = name.lower()
-        if name in BLOCK_ORDER and name not in order:
+        if name in BLOCK_NAMES and name not in order:
             order.append(name)  # deduplicated: rendering git twice costs two forks
     return tuple(order) or BLOCK_ORDER
 
@@ -1185,6 +1199,7 @@ def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
         "git": lambda: git_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
+        "render+time": render_time_segment,
     }
 
     line = ""
