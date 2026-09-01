@@ -58,14 +58,16 @@ fi
 token_info="↓${token_in_display} ↑${token_out_display}${cache_info}"
 
 # Theoretical API cost with cache-aware pricing (rates per million tokens)
-# Verified against platform.claude.com pricing, 2026-06.
+# Verified against platform.claude.com/docs/en/about-claude/pricing, 2026-09-01.
 if [[ "$model" == *"Opus 4.1"* ]]; then
-    # deprecated, retires 2026-08-05
+    # retired 2026-08-05, kept for old transcripts
     input_rate=15;    output_rate=75;   cache_write_rate=18.75; cache_read_rate=1.50
 elif [[ "$model" == *"Fable"* || "$model" == *"Mythos"* ]]; then
     input_rate=10;    output_rate=50;   cache_write_rate=12.50; cache_read_rate=1.00
 elif [[ "$model" == *"Opus"* ]]; then
     input_rate=5;     output_rate=25;   cache_write_rate=6.25;  cache_read_rate=0.50
+elif [[ "$model" == *"Sonnet 5"* ]]; then
+    input_rate=2;     output_rate=10;   cache_write_rate=2.50;  cache_read_rate=0.20
 elif [[ "$model" == *"Sonnet"* ]]; then
     input_rate=3;     output_rate=15;   cache_write_rate=3.75;  cache_read_rate=0.30
 elif [[ "$model" == *"Haiku"* ]]; then

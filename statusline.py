@@ -26,39 +26,59 @@ MAGENTA = "\033[0;35m"
 CYAN = "\033[0;36m"
 GRAY = "\033[0;37m"
 
-# Rates per MTok: (input, output); cache: write=1.25x input, read=0.1x input
-# Verified against platform.claude.com pricing, 2026-06.
+# Tiers: (match key, family label, (input, output) rate per MTok).
+# Cache multipliers on the input rate: 5m write 1.25x, 1h write 2x, read 0.1x.
+# Verified against platform.claude.com/docs/en/about-claude/pricing, 2026-09-01.
 # Display-name families — fallback for transcript entries without a model id.
 # More specific keys first — "Opus 4.1" must win over "Opus".
-BASE_RATES = {
-    "Opus 4.1": (15, 75),  # deprecated, retires 2026-08-05
-    "Fable": (10, 50),
-    "Mythos": (10, 50),
-    "Opus": (5, 25),
-    "Sonnet": (3, 15),
-    "Haiku": (1, 5),
-}
+BASE_TIERS = (
+    ("Opus 4.1", "Opus", (15, 75)),  # retired 2026-08-05; kept for old transcripts
+    ("Fable", "Fable", (10, 50)),
+    ("Mythos", "Mythos", (10, 50)),
+    ("Opus", "Opus", (5, 25)),
+    ("Sonnet 5", "Sonnet", (2, 10)),  # introductory $2/$10 is now the standard price
+    ("Sonnet", "Sonnet", (3, 15)),  # Sonnet 4.6 and earlier
+    ("Haiku", "Haiku", (1, 5)),
+)
 # Model-id substrings (lowercase, most specific first) — per-entry pricing;
 # one session mixes models (subagents often run on a different tier).
-MODEL_RATES = (
-    ("opus-4-1", (15, 75)),  # deprecated, retires 2026-08-05
-    ("fable", (10, 50)),
-    ("mythos", (10, 50)),
-    ("opus", (5, 25)),
-    ("haiku", (1, 5)),
-    ("sonnet", (3, 15)),
+MODEL_TIERS = (
+    ("opus-4-1", "Opus", (15, 75)),
+    ("fable", "Fable", (10, 50)),
+    ("mythos", "Mythos", (10, 50)),
+    ("opus", "Opus", (5, 25)),
+    ("haiku", "Haiku", (1, 5)),
+    ("sonnet-5", "Sonnet", (2, 10)),
+    ("sonnet", "Sonnet", (3, 15)),
 )
-DEFAULT_RATE = (3, 15)
+DEFAULT_TIER = ("?", (3, 15))
+# Fast mode (/fast) bills Opus 5 and Opus 4.8 at Fable-tier rates across the
+# whole request; the API echoes the speed it actually served in usage.speed.
+FAST_RATES = (10, 50)
 
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
 # Bump on schema OR pricing changes — cached usd values depend on the rate tables
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 WEB_SEARCH_USD = 0.01  # $10 per 1000 searches
 USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_S = 300  # hide burn rate for sessions under 5 minutes (too noisy)
 IDLE_GAP_S = 3600  # response→next-prompt breaks longer than this don't count as session time
 RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
+MODEL_MIX_MAX = 2  # extra model families shown next to the main-loop model
+MODEL_MIX_MIN_PCT = 1  # below this share of session cost a family is noise
+
+# Per-model weekly windows (Fable) live only in the plan usage endpoint — the
+# statusline payload carries five_hour/seven_day and nothing else. A detached
+# refresher does the GET; the render path only ever reads the cache file.
+USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+USAGE_CACHE_VERSION = 1
+USAGE_CACHE_TTL_S = 600  # at most one GET per 10 min, shared by every session
+USAGE_TIMEOUT_S = 8
+USAGE_LOCK_S = 60  # a refresher killed mid-flight must not block the next one
+USAGE_RETRY_NET_S = 300  # transient failure: back off before asking again
+USAGE_RETRY_AUTH_S = 1800  # no/expired token: Claude Code owns the refresh
+USAGE_STALE_S = 3600  # past this the last good numbers stop being shown
 
 
 def as_number(value) -> float | None:
@@ -157,7 +177,31 @@ def model_segment(data: dict) -> str:
     effort = get_effort(data)
     if effort:
         model = f"{model} E/{effort}"
+    if data.get("fast_mode") is True:
+        model = f"{model} ⚡"  # /fast doubles the Opus rate to $10/$50 per MTok
     return model
+
+
+def model_mix_segment(current: str, stats: dict) -> str:
+    """Cost share of families the main loop is NOT running on.
+
+    Subagents, workflows and mid-session /model switches routinely bill on a
+    different tier — Fable at 2x Opus — and the payload only ever names the
+    main-loop model, so that spend is otherwise invisible.
+    """
+    total = stats["usd"]
+    if total <= 0:
+        return ""
+    others = sorted(
+        ((label, usd) for label, usd in stats["models"].items() if label != current),
+        key=lambda item: -item[1],
+    )
+    parts = [
+        f"+{label} {usd * 100 / total:.0f}%"
+        for label, usd in others[:MODEL_MIX_MAX]
+        if usd * 100 / total >= MODEL_MIX_MIN_PCT
+    ]
+    return f" {' '.join(parts)}" if parts else ""
 
 
 # --- Context window ---
@@ -191,20 +235,26 @@ def context_segment(data: dict) -> str:
 # subagents/workflows under <transcript-dir>/<session-id>/. All are scanned and
 # cached per file; cost is priced per entry from message.model.
 
-def family_rates(model: str) -> tuple:
-    for key, rates in BASE_RATES.items():
+def family_tier(model: str) -> tuple:
+    """(family label, rates) from the payload display name."""
+    for key, label, rates in BASE_TIERS:
         if key in model:
-            return rates
-    return DEFAULT_RATE
+            return label, rates
+    return DEFAULT_TIER
 
 
-def model_rates(model_id, default: tuple) -> tuple:
+def model_tier(model_id, default: tuple, speed=None) -> tuple:
+    """(family label, rates) for one transcript entry, keyed on its model id."""
+    label, rates = default
     if isinstance(model_id, str):
         mid = model_id.lower()
-        for key, rates in MODEL_RATES:
+        for key, tier_label, tier_rates in MODEL_TIERS:
             if key in mid:
-                return rates
-    return default
+                label, rates = tier_label, tier_rates
+                break
+    if speed == "fast" and rates == (5, 25):
+        rates = FAST_RATES  # only Opus 5 / 4.8 can serve fast mode
+    return label, rates
 
 
 def usage_cost(usage: list[int], rates: tuple) -> float:
@@ -231,6 +281,7 @@ def empty_file_state() -> dict:
         "cr": 0,
         "out": 0,
         "usd": 0.0,
+        "models": {},  # family label -> usd, so a pricier tier stays visible
         "recent": {},  # message.id -> last usage [in, cc, cr, out], FIFO-bounded
         # Event-walk times (main file only): gaps between consecutive events
         # (real user prompt / assistant entry) longer than IDLE_GAP_S are breaks
@@ -254,6 +305,7 @@ def empty_totals() -> dict:
         "cr": 0,
         "out": 0,
         "usd": 0.0,
+        "models": {},
         "ai_s": 0,
         "active_s": 0,
         "last_activity": 0.0,
@@ -294,6 +346,12 @@ def valid_file_state(state) -> dict | None:
     fp = state.get("fp")
     if isinstance(fp, list) and len(fp) == 2 and all(is_count(v) for v in fp):
         out["fp"] = fp
+    models = state.get("models")
+    if isinstance(models, dict):
+        for label, usd in models.items():
+            val = as_number(usd)
+            if isinstance(label, str) and val is not None and val >= 0:
+                out["models"][label] = val
     recent = state.get("recent")
     if isinstance(recent, dict):
         for mid, usage in recent.items():
@@ -367,26 +425,26 @@ def extract_usage(u: dict) -> list[int]:
     return usage
 
 
-def iterations_cost(u: dict, default_rates: tuple) -> float:
-    """Billed earlier attempts (e.g. model fallback) recorded only in usage.iterations.
+def iteration_costs(u: dict, default: tuple, speed=None) -> list:
+    """Billed earlier attempts (e.g. model fallback) recorded in usage.iterations.
 
     The top-level usage equals the LAST iteration; previous ones were separate
-    billed calls, often on a different (more expensive) model.
+    billed calls, often on a different (more expensive) model. Returns
+    (family label, usd) pairs so each attempt lands on its own tier.
     """
     iterations = u.get("iterations")
     if not isinstance(iterations, list) or len(iterations) < 2:
-        return 0.0
-    extra = 0.0
+        return []
+    costs = []
     for attempt in iterations[:-1]:
         if isinstance(attempt, dict):
-            extra += usage_cost(
-                extract_usage(attempt), model_rates(attempt.get("model"), default_rates)
-            )
-    return extra
+            label, rates = model_tier(attempt.get("model"), default, speed)
+            costs.append((label, usage_cost(extract_usage(attempt), rates)))
+    return costs
 
 
 def accumulate_entry(
-    state: dict, line: bytes, entry: dict, default_rates: tuple, session: dict, is_main: bool
+    state: dict, line: bytes, entry: dict, default_tier: tuple, session: dict, is_main: bool
 ) -> None:
     message = entry.get("message")
     if not isinstance(message, dict):
@@ -394,7 +452,8 @@ def accumulate_entry(
     u = message.get("usage")
     if isinstance(u, dict):
         usage = extract_usage(u)
-        rates = model_rates(message.get("model"), default_rates)
+        speed = u.get("speed")
+        label, rates = model_tier(message.get("model"), default_tier, speed)
         mid = message.get("id")
         recent = state["recent"]
         prev = recent.get(mid) if isinstance(mid, str) else None
@@ -404,16 +463,21 @@ def accumulate_entry(
             # lines repeat identical iterations, so those are not re-added.
             for i, key in enumerate(USAGE_KEYS):
                 state[key] += usage[i] - prev[i]
-            state["usd"] += usage_cost(usage, rates) - usage_cost(prev, rates)
+            costs = [(label, usage_cost(usage, rates) - usage_cost(prev, rates))]
             recent[mid] = usage
         else:
             for i, key in enumerate(USAGE_KEYS):
                 state[key] += usage[i]
-            state["usd"] += usage_cost(usage, rates) + iterations_cost(u, default_rates)
+            costs = [(label, usage_cost(usage, rates))]
+            costs += iteration_costs(u, (label, rates), speed)
             if isinstance(mid, str) and mid:
                 if len(recent) >= RECENT_IDS_MAX:
                     recent.pop(next(iter(recent)))
                 recent[mid] = usage
+        models = state["models"]
+        for cost_label, cost_usd in costs:
+            state["usd"] += cost_usd
+            models[cost_label] = models.get(cost_label, 0.0) + cost_usd
     if is_main and b'"Task"' in line:
         content = message.get("content")
         if not isinstance(content, list):
@@ -431,7 +495,7 @@ def accumulate_entry(
 
 
 def scan_file(
-    path: str, state: dict, default_rates: tuple, session: dict, is_main: bool
+    path: str, state: dict, default_tier: tuple, session: dict, is_main: bool
 ) -> bool:
     """Incrementally scan one append-only JSONL file; True if state changed."""
     try:
@@ -495,7 +559,7 @@ def scan_file(
                                     state["wait_s"] += gap
                             state["last_event"] = max(state["last_event"], ts)
                     try:
-                        accumulate_entry(state, line, entry, default_rates, session, is_main)
+                        accumulate_entry(state, line, entry, default_tier, session, is_main)
                     except Exception:
                         continue  # one poison line must not stall the offset cache
         if offset != state["offset"]:
@@ -522,7 +586,7 @@ def subagent_files(transcript_path: str) -> list[str]:
     return sorted(found)
 
 
-def scan_session(transcript_path: str, default_rates: tuple) -> dict:
+def scan_session(transcript_path: str, default_tier: tuple) -> dict:
     """Aggregate usage and cost over the main transcript and all subagent files.
 
     States for files that vanished are kept — their cost was incurred. Only the
@@ -537,7 +601,7 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
             state = empty_file_state()
             session["files"][path] = state
         changed |= scan_file(
-            path, state, default_rates, session, is_main=(path == transcript_path)
+            path, state, default_tier, session, is_main=(path == transcript_path)
         )
     if changed:
         save_stats_cache(cache_file, session)
@@ -546,6 +610,8 @@ def scan_session(transcript_path: str, default_rates: tuple) -> dict:
         for key in USAGE_KEYS:
             totals[key] += state[key]
         totals["usd"] += state["usd"]
+        for label, usd in state["models"].items():
+            totals["models"][label] = totals["models"].get(label, 0.0) + usd
     main_state = session["files"].get(transcript_path)
     if main_state is not None:
         totals["ai_s"] = int(main_state["wait_s"])
@@ -604,6 +670,234 @@ def lines_segment(data: dict) -> str:
     return f" | {GREEN}+{added}{RESET}/{RED}-{removed}{RESET}"
 
 
+# --- Model-scoped usage windows (plan usage endpoint) ---
+
+def usage_cache_path() -> str:
+    import tempfile
+
+    # Shared by every session on the machine: five open terminals still make
+    # one request per TTL, not five.
+    return os.path.join(tempfile.gettempdir(), "claude-statusline-usage.json")
+
+
+def valid_usage_cache(cache) -> dict | None:
+    if not isinstance(cache, dict) or cache.get("v") != USAGE_CACHE_VERSION:
+        return None
+    out = {"v": USAGE_CACHE_VERSION, "windows": []}
+    for key in ("ts", "ok_ts", "next_try"):
+        val = as_number(cache.get(key))
+        if val is None or val < 0:
+            return None
+        out[key] = val
+    windows = cache.get("windows")
+    if not isinstance(windows, list):
+        return None
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        label = window.get("label")
+        pct = as_number(window.get("pct"))
+        resets = as_number(window.get("resets_at"))
+        if isinstance(label, str) and label and pct is not None:
+            out["windows"].append({"label": label, "pct": pct, "resets_at": resets or 0.0})
+    return out
+
+
+def read_usage_cache() -> dict | None:
+    try:
+        with open(usage_cache_path(), "r", encoding="utf-8") as f:
+            return valid_usage_cache(json.load(f))
+    except Exception:
+        return None
+
+
+def write_usage_cache(windows: list, ok_ts: float, retry_s: float) -> None:
+    now = time.time()
+    cache = {
+        "v": USAGE_CACHE_VERSION,
+        "ts": now,
+        "ok_ts": ok_ts,
+        "next_try": now + retry_s,
+        "windows": windows,
+    }
+    path = usage_cache_path()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def oauth_access_token() -> str | None:
+    """Claude Code's own OAuth token — credentials file, else the macOS Keychain.
+
+    Never persisted anywhere by this script; only the resulting percentages are
+    cached. An expired token is treated as absent: Claude Code owns the refresh
+    and racing it would burn the refresh token.
+    """
+    raw = ""
+    try:
+        with open(
+            os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json"),
+            "r", encoding="utf-8",
+        ) as f:
+            raw = f.read()
+    except OSError:
+        if sys.platform != "darwin":
+            return None
+        import subprocess
+
+        try:
+            raw = subprocess.check_output(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                stderr=subprocess.DEVNULL, text=True, timeout=10,
+            )
+        except Exception:
+            return None
+    try:
+        oauth = json.loads(raw).get("claudeAiOauth")
+    except Exception:
+        return None
+    if not isinstance(oauth, dict):
+        return None
+    expires = as_number(oauth.get("expiresAt"))
+    if expires is not None and expires / 1000 <= time.time():
+        return None
+    token = oauth.get("accessToken")
+    return token if isinstance(token, str) and token else None
+
+
+def scoped_windows(body: dict) -> list:
+    """weekly_scoped entries of limits[] — one per model bucket (e.g. Fable).
+
+    Keyed off `kind` rather than fixed field names: seven_day_opus and
+    seven_day_sonnet are null on plans that only have a Fable bucket, and the
+    set of scoped models changes server-side.
+    """
+    found = []
+    limits = body.get("limits")
+    if not isinstance(limits, list):
+        return found
+    for item in limits:
+        if not isinstance(item, dict) or item.get("kind") != "weekly_scoped":
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        label = model.get("display_name") if isinstance(model, dict) else None
+        pct = as_number(item.get("percent"))
+        if not isinstance(label, str) or not label or pct is None:
+            continue
+        found.append({
+            "label": label[:12],
+            "pct": pct,
+            "resets_at": parse_ts(item.get("resets_at")),
+        })
+    return found
+
+
+def short_label(label: str, initials: list) -> str:
+    """"Fable" -> "F"; the full label only when two buckets share an initial."""
+    initial = label[:1].upper()
+    return initial if initials.count(initial) == 1 else label
+
+
+def refresh_usage_cache() -> None:
+    """`--refresh-usage` entry point: one GET, then rewrite the shared cache."""
+    lock = f"{usage_cache_path()}.lock"
+    try:
+        if time.time() - os.stat(lock).st_mtime < USAGE_LOCK_S:
+            return  # another refresher is in flight
+        os.unlink(lock)
+    except OSError:
+        pass
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except OSError:
+        return
+    try:
+        previous = read_usage_cache()
+        token = oauth_access_token()
+        if token is None:
+            body, status = None, 401
+        else:
+            body, status = usage_request(token)
+        if status == 200 and isinstance(body, dict):
+            write_usage_cache(scoped_windows(body), time.time(), 0)
+        else:
+            # Keep the last good numbers; the render side ages them out.
+            retry = USAGE_RETRY_AUTH_S if status in (401, 403) else USAGE_RETRY_NET_S
+            write_usage_cache(
+                previous["windows"] if previous else [],
+                previous["ok_ts"] if previous else 0.0,
+                retry,
+            )
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+
+
+def usage_request(token: str) -> tuple:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        USAGE_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-statusline",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=USAGE_TIMEOUT_S) as response:
+            return json.loads(response.read().decode("utf-8", "replace")), response.status
+    except urllib.error.HTTPError as err:
+        return None, err.code
+    except Exception:
+        return None, 0
+
+
+def spawn_usage_refresh() -> None:
+    """Fire and forget — the render must never wait on the network."""
+    import subprocess
+
+    kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--refresh-usage"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **kwargs,
+        )
+    except Exception:
+        pass
+
+
+def scoped_limit_parts() -> list:
+    if os.environ.get("STATUSLINE_NO_USAGE_API") == "1":
+        return []
+    cache = read_usage_cache()
+    now = time.time()
+    if cache is None:
+        spawn_usage_refresh()
+        return []
+    if now - cache["ts"] >= USAGE_CACHE_TTL_S and now >= cache["next_try"]:
+        spawn_usage_refresh()  # this render still draws the cached numbers
+    if now - cache["ok_ts"] > USAGE_STALE_S:
+        return []
+    live = [w for w in cache["windows"] if not w["resets_at"] or w["resets_at"] > now]
+    initials = [w["label"][:1].upper() for w in live]
+    return [
+        f"{rate_color(w['pct'])}{short_label(w['label'], initials)}:{w['pct']:.0f}%{RESET}"
+        for w in live
+    ]
+
+
 # --- Rate limits ---
 
 def rate_color(pct: float) -> str:
@@ -642,6 +936,7 @@ def rate_limits_segment(data: dict) -> str:
             continue
         label = format_remaining(window.get("resets_at")) or fallback
         parts.append(f"{rate_color(pct)}{label}:{pct:.0f}%{RESET}")
+    parts.extend(scoped_limit_parts())  # per-model weekly buckets (e.g. Fable)
     return f" | {' '.join(parts)}" if parts else ""
 
 
@@ -803,8 +1098,9 @@ def build_line(data: dict) -> str:
     if not isinstance(transcript_path, str):
         transcript_path = ""
 
+    tier = family_tier(model)
     if transcript_path and os.path.isfile(transcript_path):
-        stats = scan_session(transcript_path, family_rates(model))
+        stats = scan_session(transcript_path, tier)
     else:
         stats = empty_totals()
 
@@ -812,7 +1108,7 @@ def build_line(data: dict) -> str:
         f"{context_segment(data)}"
         f" | {MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}"
         f" | {YELLOW}{cost_segment(data, stats)}{RESET}"
-        f" | {BLUE}{model}{RESET}"
+        f" | {BLUE}{model}{RESET}{GRAY}{model_mix_segment(tier[0], stats)}{RESET}"
         f" | {CYAN}{tokens_segment(stats)}{RESET}"
         f"{lines_segment(data)}"
         f"{rate_limits_segment(data)}"
@@ -830,6 +1126,9 @@ def safe_print(line: str) -> None:
 
 
 def main() -> None:
+    if "--refresh-usage" in sys.argv[1:]:
+        refresh_usage_cache()
+        return
     try:
         # Bytes + lenient decode: invalid UTF-8 on stdin must not raise
         raw = sys.stdin.buffer.read().decode("utf-8", "replace") if sys.stdin else ""

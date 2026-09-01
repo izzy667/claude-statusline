@@ -12,7 +12,12 @@ kontekstu, segment `+N/-N` linii, effort z payloadu (`effort.level`), czas sesji
 `cost.total_duration_ms`, agregacja transkryptów subagentów/workflow
 (`<katalog-transkryptu>/<id-sesji>/**/*.jsonl`) i wycena per wpis z `message.model`
 (sesje mieszają modele — bez tego szacunek nie zgadzał się z oficjalnym
-`total_cost_usd` nawet 5x przy sesjach z workflow).
+`total_cost_usd` nawet 5x przy sesjach z workflow), rozbicie kosztu per rodzina
+modelu obok nazwy modelu (`+Fable 13%`), wycena fast mode po `usage.speed`, oraz
+tygodniowe okna per model (`F:5%`) z `GET /api/oauth/usage` — odświeżane przez
+odłączony proces (`--refresh-usage`) do wspólnego cache'u w tmpdir, TTL 10 min,
+z lockiem przeciw równoległym zapytaniom; render nigdy nie czeka na sieć,
+a `STATUSLINE_NO_USAGE_API=1` wyłącza to całkowicie.
 
 ## Do zrobienia
 
@@ -70,3 +75,11 @@ Każde to jednolinijkowy `.get()` z wyświetlaniem tylko przy obecności pola.
 - **`statusline-cmd.sh` to wersja legacy** — ma zaktualizowany cennik, ale żadnej
   z powyższych poprawek (podwójne liczenie tokenów, brak cache'u, git w worktree,
   crashe). Docelowo: usunąć albo przeportować zmiany z wersji Python.
+- **Payload statusline nie zawiera limitów per model.** Zweryfikowane w binarce
+  2.1.252: `rate_limits` składane jest wyłącznie z `five_hour`, `seven_day`
+  i `spend_limit`. Kubełki `seven_day_opus`, `seven_day_sonnet` i `model_scoped[]`
+  istnieją tylko w protokole `/usage`, a snapshot limitów żyje w pamięci procesu
+  (z nagłówków odpowiedzi) i nie trafia na dysk — stąd własne odpytywanie
+  `/api/oauth/usage`. W odpowiedzi liczy się `limits[]`: wpisy `kind:"weekly_scoped"`
+  z `scope.model.display_name`, bo klucze `seven_day_*` bywają `null` na kontach,
+  które mają tylko kubełek Fable.
