@@ -223,6 +223,19 @@ def context_color(pct: float) -> str:
     return GREEN
 
 
+def format_context(current: int, size: int) -> tuple:
+    """Used side always in K; only the total switches to M at a 1M window.
+
+    "341K/1M" beats both "341K/1000K" and "0.34M/1M" — the used value is the one
+    that changes every render, so it stays in the shortest unit. The total drops
+    trailing zeros (1M, not 1.00M) since it is a constant per model.
+    """
+    used = f"{current // 1000}K"
+    if size < 1_000_000:
+        return used, f"{size // 1000}K"
+    return used, f"{f'{size / 1_000_000:.2f}'.rstrip('0').rstrip('.')}M"
+
+
 def context_segment(data: dict) -> str:
     cw = data.get("context_window")
     usage = cw.get("current_usage") if isinstance(cw, dict) else None
@@ -235,7 +248,8 @@ def context_segment(data: dict) -> str:
     if size <= 0:
         return f"{GREEN}{current // 1000}K{RESET}"
     pct = current * 100 // size
-    return f"{context_color(pct)}{current // 1000}K/{size // 1000}K ({pct}%){RESET}"
+    used, total = format_context(current, size)
+    return f"{context_color(pct)}{used}/{total} ({pct}%){RESET}"
 
 
 # --- Transcript scan (single incremental pass with an offset cache) ---
