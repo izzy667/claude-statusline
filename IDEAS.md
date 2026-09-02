@@ -27,7 +27,20 @@ spacje, wielkość liter bez znaczenia, duplikaty i nieznane nazwy pomijane, bra
 argumentu = kolejność domyślna). Nazwy: `context`, `duration`, `cost`, `model`,
 `tokens`, `lines`, `limits`, `git`, `task`, `render`, plus `render+time`
 (czas renderu z zegarem lokalnym w nawiasie) — dostępny tylko po jawnym podaniu,
-poza kolejnością domyślną. Blok pominięty w argumencie
+poza kolejnością domyślną. Czas sesji i czas oczekiwania są domyślnie liczone
+**dla bieżącego uruchomienia**, nie dla całego transkryptu: `total_cost_usd`
+i `total_duration_ms` zerują się przy każdym `--resume`, więc dwumiesięczny
+transkrypt zestawiałby koszt jednego przebiegu ze 170 godzinami zegara. Okno
+wyznacza `teraz − total_duration_ms`, a czas aktywny jest w nim odtwarzany
+z 15-minutowych kubełków trzymanych w cache'u (retencja 7 dni, kubełek
+przecinający początek okna liczony proporcjonalnie; błąd rzędu kilku minut).
+`STATUSLINE_DURATION_TOTAL=1` przełącza wyświetlanie z powrotem na cały
+transkrypt — burn rate zostaje przy oknie procesu, bo dzieli koszt z tego
+samego zakresu. Za nawiasem z czasem oczekiwania dochodzi zgrubny czas całego
+transkryptu (`3h44m (⧗ 1h14m) / 42h`): godziny do 99h, wyżej dni (`7d`).
+Pokazywany tylko wtedy, gdy wnosi informację — czyli przy wznowionej sesji;
+świeża rozmowa ma oba czasy równe, a przy `STATUSLINE_DURATION_TOTAL=1`
+dopisek powtarzałby liczbę już wyświetloną. Blok pominięty w argumencie
 nie jest liczony — wyrzucenie `git` oszczędza dwa wywołania procesu.
 
 ## Do zrobienia

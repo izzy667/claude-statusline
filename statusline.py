@@ -59,12 +59,17 @@ FAST_RATES = (10, 50)
 EFFORT_ABBREV = {"low": "low", "medium": "med", "high": "high", "max": "max", "auto": "auto"}
 
 # Bump on schema OR pricing changes — cached usd values depend on the rate tables
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 WEB_SEARCH_USD = 0.01  # $10 per 1000 searches
 USAGE_KEYS = ("in", "cc", "cr", "out")
 BURN_RATE_MIN_S = 300  # hide burn rate for sessions under 5 minutes (too noisy)
 IDLE_GAP_S = 3600  # response→next-prompt breaks longer than this don't count as session time
 RECENT_IDS_MAX = 16  # dedup window: streamed duplicates are near-consecutive in practice
+# Session time is bucketed so it can be sliced to the current run: cost and
+# total_duration_ms reset on every resume, the transcript does not.
+TIME_BUCKET_S = 900
+TIME_BUCKET_KEEP_S = 7 * 86400
+SPAN_MIN_DELTA_S = 300  # below this the transcript total just repeats the run
 WAIT_MARK = "⧗ "  # marks the waiting time so two clocks side by side stay readable
 MODEL_MIX_MAX = 2  # extra model families shown next to the main-loop model
 MODEL_MIX_MIN_PCT = 1  # below this share of session cost a family is noise
@@ -314,6 +319,9 @@ def empty_file_state() -> dict:
         # time too when they end in an assistant entry after a prompt.
         "wait_s": 0.0,
         "active_s": 0.0,
+        # bucket start (epoch, TIME_BUCKET_S aligned) -> [active, wait]
+        "buckets": {},
+        "buckets_from": 0.0,  # oldest instant the buckets still cover
         "last_event": 0.0,  # timestamp of the newest counted event
         "turn_open": 0.0,  # 1.0 once any prompt was seen (gap→wait attribution)
     }
@@ -335,6 +343,10 @@ def empty_totals() -> dict:
         "active_s": 0,
         "last_activity": 0.0,
         "last_task": "",
+        "buckets": {},
+        "buckets_from": 0.0,
+        "win_active_s": None,  # same two figures sliced to the current run
+        "win_wait_s": None,
     }
 
 
@@ -363,7 +375,7 @@ def valid_file_state(state) -> dict | None:
         if not is_count(state.get(key)):
             return None
         out[key] = state[key]
-    for key in ("usd", "wait_s", "active_s", "last_event", "turn_open"):
+    for key in ("usd", "wait_s", "active_s", "last_event", "turn_open", "buckets_from"):
         val = state.get(key)
         if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
             return None
@@ -371,6 +383,16 @@ def valid_file_state(state) -> dict | None:
     fp = state.get("fp")
     if isinstance(fp, list) and len(fp) == 2 and all(is_count(v) for v in fp):
         out["fp"] = fp
+    buckets = state.get("buckets")
+    if isinstance(buckets, dict):
+        for start, pair in buckets.items():
+            if not isinstance(start, str) or not start.lstrip("-").isdigit():
+                continue
+            if not isinstance(pair, list) or len(pair) != 2:
+                continue
+            values = [as_number(v) for v in pair]
+            if all(v is not None and v >= 0 for v in values):
+                out["buckets"][start] = values
     models = state.get("models")
     if isinstance(models, dict):
         for label, usd in models.items():
@@ -519,6 +541,56 @@ def accumulate_entry(
                     session["last_task"] = desc
 
 
+def add_time(state: dict, ts: float, gap: float, waited: bool) -> None:
+    """Book one counted gap into the running totals and its 15-minute bucket.
+
+    The gap is filed under the bucket it ends in — gaps are capped at
+    IDLE_GAP_S, so the misattribution only ever shows at a window edge.
+    """
+    state["active_s"] += gap
+    if waited:
+        state["wait_s"] += gap
+    key = str(int(ts // TIME_BUCKET_S) * TIME_BUCKET_S)
+    bucket = state["buckets"].get(key)
+    if bucket is None:
+        state["buckets"][key] = [gap, gap if waited else 0.0]
+    else:
+        bucket[0] += gap
+        if waited:
+            bucket[1] += gap
+
+
+def prune_buckets(state: dict) -> None:
+    cutoff = time.time() - TIME_BUCKET_KEEP_S
+    stale = [k for k in state["buckets"] if int(k) + TIME_BUCKET_S <= cutoff]
+    for key in stale:
+        del state["buckets"][key]
+    if stale:
+        state["buckets_from"] = max(state["buckets_from"], cutoff)
+
+
+def window_times(state: dict, since: float) -> tuple | None:
+    """(active, wait) inside [since, now]; None when the buckets miss the start.
+
+    A run older than the bucket retention cannot be sliced, and reporting a
+    truncated figure as the session length would be worse than falling back.
+    """
+    if since < state["buckets_from"]:
+        return None
+    active = wait = 0.0
+    for key, (bucket_active, bucket_wait) in state["buckets"].items():
+        start = int(key)
+        end = start + TIME_BUCKET_S
+        if end <= since:
+            continue
+        # The bucket the window opens in is counted pro rata, otherwise work
+        # done just before the resume would be credited to the current run.
+        share = 1.0 if start >= since else (end - since) / TIME_BUCKET_S
+        active += bucket_active * share
+        wait += bucket_wait * share
+    return active, wait
+
+
 def scan_file(
     path: str, state: dict, default_tier: tuple, session: dict, is_main: bool
 ) -> bool:
@@ -568,7 +640,7 @@ def scan_file(
                     if ts > 0:
                         gap = ts - state["last_event"]
                         if state["last_event"] > 0 and 0 < gap <= IDLE_GAP_S:
-                            state["active_s"] += gap
+                            add_time(state, ts, gap, waited=False)
                         state["last_event"] = max(state["last_event"], ts)
                         state["turn_open"] = 1.0
                 elif etype == "assistant":
@@ -579,9 +651,7 @@ def scan_file(
                         if ts > 0:
                             gap = ts - state["last_event"]
                             if state["last_event"] > 0 and 0 < gap <= IDLE_GAP_S:
-                                state["active_s"] += gap
-                                if state["turn_open"] > 0:
-                                    state["wait_s"] += gap
+                                add_time(state, ts, gap, waited=state["turn_open"] > 0)
                             state["last_event"] = max(state["last_event"], ts)
                     try:
                         accumulate_entry(state, line, entry, default_tier, session, is_main)
@@ -628,6 +698,11 @@ def scan_session(transcript_path: str, default_tier: tuple) -> dict:
         changed |= scan_file(
             path, state, default_tier, session, is_main=(path == transcript_path)
         )
+    main_state = session["files"].get(transcript_path)
+    if main_state is not None:
+        before = len(main_state["buckets"])
+        prune_buckets(main_state)
+        changed |= len(main_state["buckets"]) != before
     if changed:
         save_stats_cache(cache_file, session)
     totals = empty_totals()
@@ -637,11 +712,12 @@ def scan_session(transcript_path: str, default_tier: tuple) -> dict:
         totals["usd"] += state["usd"]
         for label, usd in state["models"].items():
             totals["models"][label] = totals["models"].get(label, 0.0) + usd
-    main_state = session["files"].get(transcript_path)
     if main_state is not None:
         totals["ai_s"] = int(main_state["wait_s"])
         totals["active_s"] = int(main_state["active_s"])
         totals["last_activity"] = main_state["last_event"]
+        totals["buckets"] = main_state["buckets"]
+        totals["buckets_from"] = main_state["buckets_from"]
     totals["last_task"] = session["last_task"]
     return totals
 
@@ -669,8 +745,13 @@ def cost_segment(data: dict, stats: dict) -> str:
     burn = ""
     burn_base = official if official is not None else (estimate if estimate else None)
     # $ per hour of ACTIVE session time (breaks >1h excluded), so a long idle
-    # gap doesn't dilute the rate; payload wall duration is the fallback
-    active = active_session_time(stats)
+    # gap doesn't dilute the rate. Each cost is divided by time from its OWN
+    # scope: the official figure covers this run, the estimate the whole
+    # transcript. Payload wall duration is the last-resort fallback.
+    if official is not None and stats["win_active_s"] is not None:
+        active = active_session_time(stats, stats["win_active_s"])
+    else:
+        active = active_session_time(stats)
     if active is None and duration_ms and duration_ms > 0:
         active = duration_ms / 1000
     if burn_base is not None and active and active >= BURN_RATE_MIN_S:
@@ -983,8 +1064,52 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{minutes}m" if hours > 0 else f"{minutes}m"
 
 
-def active_session_time(stats: dict) -> int | None:
-    """Transcript-derived session time minus idle breaks over IDLE_GAP_S.
+def apply_process_window(data: dict, stats: dict) -> None:
+    """Slice active and wait time to the run the payload's cost belongs to.
+
+    total_cost_usd and total_duration_ms both restart on resume while the
+    transcript keeps growing, so a two-month transcript would otherwise pair one
+    run's cost with two months of clock.
+    """
+    cost_obj = data.get("cost")
+    ms = as_number(cost_obj.get("total_duration_ms")) if isinstance(cost_obj, dict) else None
+    if not ms or ms <= 0:
+        return
+    times = window_times(stats, time.time() - ms / 1000)
+    if times is not None:
+        stats["win_active_s"], stats["win_wait_s"] = times
+
+
+def format_span(seconds: float) -> str:
+    """Two digits of transcript total: hours up to 99h, days beyond."""
+    hours = math.ceil(seconds / 3600)
+    return f"{hours}h" if hours < 100 else f"{round(seconds / 86400)}d"
+
+
+def transcript_span(stats: dict, shown: int) -> str:
+    """Whole-transcript session time, but only when it adds something.
+
+    A fresh session has nothing before the current run, so the two figures
+    coincide and the suffix would be noise; it is equally pointless when the
+    block is already configured to show the transcript total.
+    """
+    if os.environ.get("STATUSLINE_DURATION_TOTAL") == "1" or stats["win_active_s"] is None:
+        return ""
+    total = active_session_time(stats)
+    if total is None or total <= shown + SPAN_MIN_DELTA_S:
+        return ""
+    return f" / {format_span(total)}"
+
+
+def duration_scope(stats: dict) -> tuple:
+    """(active, wait) for the configured scope — current run unless asked."""
+    if os.environ.get("STATUSLINE_DURATION_TOTAL") == "1" or stats["win_active_s"] is None:
+        return stats["active_s"], stats["ai_s"]
+    return stats["win_active_s"], stats["win_wait_s"]
+
+
+def active_session_time(stats: dict, active: float | None = None) -> int | None:
+    """Session time minus idle breaks over IDLE_GAP_S, plus the live tail.
 
     Counts turn spans plus inter-turn gaps up to the threshold; the time since
     the last activity ticks live and stops counting once it exceeds the gap.
@@ -992,15 +1117,17 @@ def active_session_time(stats: dict) -> int | None:
     """
     if stats["last_activity"] <= 0:
         return None
-    active = stats["active_s"]
+    if active is None:
+        active = stats["active_s"]
     tail = time.time() - stats["last_activity"]
     if 0 < tail <= IDLE_GAP_S:
         active += int(tail)
-    return active
+    return int(active)
 
 
 def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
-    seconds = active_session_time(stats)
+    active, wait = duration_scope(stats)
+    seconds = active_session_time(stats, active)
     if seconds is None:
         # Fallbacks when the transcript has no turn data: payload wall duration
         # (survives resumed sessions), then transcript file birthtime
@@ -1014,12 +1141,15 @@ def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
         else:
             seconds = 0
     elapsed = format_duration(seconds)
-    if stats["ai_s"] > 0:
+    if wait > 0:
         # In parentheses: wall-clock the user actually waited for responses
         # (sum of user-prompt → last-assistant-entry spans from the transcript;
-        # NOT total_api_duration_ms, which multiply-counts parallel subagents)
-        elapsed += f" ({WAIT_MARK}{format_duration(stats['ai_s'])})"
-    return elapsed
+        # NOT total_api_duration_ms, which multiply-counts parallel subagents).
+        # Same scope as the figure before it, so it is always contained in it.
+        elapsed += f" ({WAIT_MARK}{format_duration(int(wait))})"
+    # Trailing "/ 42h": how long the whole transcript has been worked on, idle
+    # breaks excluded the same way, when the run is only part of it.
+    return elapsed + transcript_span(stats, seconds)
 
 
 # --- Git ---
@@ -1183,6 +1313,7 @@ def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
         stats = scan_session(transcript_path, tier)
     else:
         stats = empty_totals()
+    apply_process_window(data, stats)
 
     # Lazy on purpose: a block left out of the order is never computed, so
     # dropping "git" also drops its two subprocess calls.
