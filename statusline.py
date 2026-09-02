@@ -71,6 +71,10 @@ TIME_BUCKET_S = 900
 TIME_BUCKET_KEEP_S = 7 * 86400
 SPAN_MIN_DELTA_S = 300  # below this the transcript total just repeats the run
 WAIT_MARK = "⧗ "  # marks the waiting time so two clocks side by side stay readable
+# Warm cache countdown. A renewal arrow: the window rolls forward on every
+# request, so what it counts down is time until the next refresh is needed.
+CACHE_MARK = "↻ "
+CACHE_WARN_MIN = 20  # highlight once the warm window is worth hurrying back for
 MODEL_MIX_MAX = 2  # extra model families shown next to the main-loop model
 MODEL_MIX_MIN_PCT = 1  # below this share of session cost a family is noise
 
@@ -85,6 +89,7 @@ USAGE_LOCK_S = 60  # a refresher killed mid-flight must not block the next one
 USAGE_RETRY_NET_S = 300  # transient failure: back off before asking again
 USAGE_RETRY_AUTH_S = 1800  # no/expired token: Claude Code owns the refresh
 USAGE_STALE_S = 3600  # past this the last good numbers stop being shown
+USAGE_IDLE_STOP_S = 900  # quiet for this long: stop polling, nobody is watching
 
 
 def as_number(value) -> float | None:
@@ -994,15 +999,23 @@ def spawn_usage_refresh() -> None:
         pass
 
 
-def scoped_limit_parts() -> list:
+def scoped_limit_parts(last_activity: float) -> list:
+    """Rendered per-model windows; may kick off a background refresh.
+
+    A periodic refreshInterval keeps rendering long after the session goes
+    quiet, so polling stops once nothing has happened for USAGE_IDLE_STOP_S —
+    an idle terminal should not keep asking the API on its own.
+    """
     if os.environ.get("STATUSLINE_NO_USAGE_API") == "1":
         return []
     cache = read_usage_cache()
     now = time.time()
+    idle = 0 < last_activity < now - USAGE_IDLE_STOP_S
     if cache is None:
-        spawn_usage_refresh()
+        if not idle:
+            spawn_usage_refresh()
         return []
-    if now - cache["ts"] >= USAGE_CACHE_TTL_S and now >= cache["next_try"]:
+    if not idle and now - cache["ts"] >= USAGE_CACHE_TTL_S and now >= cache["next_try"]:
         spawn_usage_refresh()  # this render still draws the cached numbers
     if now - cache["ok_ts"] > USAGE_STALE_S:
         return []
@@ -1038,7 +1051,7 @@ def format_remaining(resets_at) -> str:
     return f"{round(remaining / 86400)}d"
 
 
-def rate_limits_segment(data: dict) -> str:
+def rate_limits_segment(data: dict, stats: dict) -> str:
     rl = data.get("rate_limits")
     if not isinstance(rl, dict):
         return ""
@@ -1052,7 +1065,8 @@ def rate_limits_segment(data: dict) -> str:
             continue
         label = format_remaining(window.get("resets_at")) or fallback
         parts.append(f"{rate_color(pct)}{label}:{pct:.0f}%{RESET}")
-    parts.extend(scoped_limit_parts())  # per-model weekly buckets (e.g. Fable)
+    # per-model weekly buckets (e.g. Fable)
+    parts.extend(scoped_limit_parts(stats["last_activity"]))
     return " ".join(parts)
 
 
@@ -1261,9 +1275,34 @@ def render_segment() -> str:
     return f"{GRAY}{elapsed_ms():.0f}ms{RESET}"
 
 
-def render_time_segment() -> str:
-    """Render cost plus the wall clock, in the machine's local time."""
-    return f"{GRAY}{elapsed_ms():.0f}ms ({time.strftime('%H:%M')}){RESET}"
+def cache_minutes_left(data: dict) -> int | None:
+    """Whole minutes before the prompt cache goes cold; None when it is not warm.
+
+    expires_at rolls forward with every request, so this sits at the full TTL
+    while you work and only starts counting down once the session goes quiet —
+    which is exactly when the answer matters.
+    """
+    cache = data.get("prompt_cache")
+    if not isinstance(cache, dict) or cache.get("warm") is not True:
+        return None
+    expires = as_number(cache.get("expires_at"))
+    if expires is None:
+        return None
+    left = expires - time.time()
+    return math.ceil(left / 60) if left > 0 else None
+
+
+def render_time_segment(data: dict) -> str:
+    """Render cost, the wall clock, and what is left of the prompt cache."""
+    parts = [time.strftime("%H:%M")]
+    left = cache_minutes_left(data)
+    if left is not None:
+        countdown = f"{CACHE_MARK}{left}m"
+        if left < CACHE_WARN_MIN:
+            # Re-open GRAY afterwards so the closing bracket keeps the block colour
+            countdown = f"{YELLOW}{countdown}{RESET}{GRAY}"
+        parts.append(countdown)
+    return f"{GRAY}{elapsed_ms():.0f}ms ({' '.join(parts)}){RESET}"
 
 
 # Default order, applied when the command carries no block argument.
@@ -1326,11 +1365,11 @@ def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
         ),
         "tokens": lambda: f"{CYAN}{tokens_segment(stats)}{RESET}",
         "lines": lambda: lines_segment(data),
-        "limits": lambda: rate_limits_segment(data),
+        "limits": lambda: rate_limits_segment(data, stats),
         "git": lambda: git_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
-        "render+time": render_time_segment,
+        "render+time": lambda: render_time_segment(data),
     }
 
     line = ""
