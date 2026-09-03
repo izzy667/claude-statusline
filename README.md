@@ -4,9 +4,19 @@ A status line for [Claude Code](https://code.claude.com): one Python file, no
 dependencies, nothing to install. Claude Code pipes a JSON payload into the
 command on stdin; the script prints the line to stdout and exits.
 
+Out of the box it renders a single row:
+
 ```
-483K/1M (48%) | Opus 5 E/xhigh | +140/-40 | 2h:21% 18h:14% F:6%
-main ● ~1 (+44/-20) | 5h53m (⧗ 1h45m) | $67 ($11/h) | 56ms (13:51 ↻ 42m)
+487K/1M (48%) | 6h23m (⧗ 1h49m) | $69 ($11/h) | Opus 5 E/xhigh | ↓106.1M ↑362.2K C:95% | +140/-40 | 2h:22% 18h:14% F:6% | main ○ | 64ms
+```
+
+Which blocks appear, in what order, and how many rows they occupy is all
+configurable — see [Layout](#layout). Split over two rows with the clock and the
+cache countdown added, the same session reads:
+
+```
+487K/1M (48%) | Opus 5 E/xhigh | +140/-40 | 2h:22% 18h:14% F:6%
+main ○ | 6h23m (⧗ 1h49m) | $69 ($11/h) | 64ms (14:11 ↻ 38m)
 ```
 
 Most of what it shows cannot be read off the payload alone — session time, token
@@ -22,10 +32,18 @@ Point `statusLine.command` at the script in `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 /path/to/statusline.py"
+    "command": "python3 /path/to/statusline.py",
+    "refreshInterval": 60
   }
 }
 ```
+
+`refreshInterval` is worth setting from the start. Claude Code only re-runs the
+command when the session state changes, and every one of those moments is a
+moment right after a request — so anything that counts down (the warm-cache
+timer in `time`, the reset labels in `limits`) would sit at its starting value
+for as long as you work and then jump. One render a minute keeps them moving and
+costs about 60 ms of CPU each.
 
 Requires Python 3.9+. `statusline-cmd.sh` is an older shell version kept for
 reference; it has the current prices but none of the features below.
@@ -77,15 +95,14 @@ Code drop the output entirely. `;` still works if the argument is quoted.
 
 ### Refresh
 
-Claude Code re-runs the command when the session state changes and on each new
-assistant message, but not on a timer. Blocks that count down — `time`, and the
-countdown labels in `limits` — only move if you add one:
+`refreshInterval` (seconds, minimum 1) adds a periodic re-run on top of the
+event-driven ones — see [Install](#install) for why it matters. It also keeps
+the wall clock in `time` current; without it the clock freezes at whatever the
+last render saw.
 
-```json
-"statusLine": { "…": "…", "refreshInterval": 360 }
-```
-
-Seconds, minimum 1.
+One thing it changes on the network side: the plan usage lookup can now fire
+while you are away from the keyboard. That is why polling stops after 15 minutes
+of silence rather than running for as long as the terminal stays open.
 
 ## Environment variables
 
