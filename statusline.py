@@ -1292,8 +1292,8 @@ def cache_minutes_left(data: dict) -> int | None:
     return math.ceil(left / 60) if left > 0 else None
 
 
-def render_time_segment(data: dict) -> str:
-    """Render cost, the wall clock, and what is left of the prompt cache."""
+def time_segment(data: dict) -> str:
+    """Wall clock, plus what is left of the warm prompt cache."""
     parts = [time.strftime("%H:%M")]
     left = cache_minutes_left(data)
     if left is not None:
@@ -1302,7 +1302,7 @@ def render_time_segment(data: dict) -> str:
             # Re-open GRAY afterwards so the closing bracket keeps the block colour
             countdown = f"{YELLOW}{countdown}{RESET}{GRAY}"
         parts.append(countdown)
-    return f"{GRAY}{elapsed_ms():.0f}ms ({' '.join(parts)}){RESET}"
+    return f"{GRAY}{' '.join(parts)}{RESET}"
 
 
 # Default order, applied when the command carries no block argument.
@@ -1311,8 +1311,17 @@ BLOCK_ORDER = (
     "lines", "limits", "git", "task", "render",
 )
 # Blocks outside the default line — available only by naming them explicitly.
-EXTRA_BLOCKS = ("render+time",)
+EXTRA_BLOCKS = ("time",)
 BLOCK_NAMES = BLOCK_ORDER + EXTRA_BLOCKS
+# "a+b" renders b bracketed after a; the brackets take the colour of the block
+# they belong to. Blocks that paint themselves are absent here.
+BLOCK_BRACKET_COLOR = {
+    "duration": MAGENTA, "cost": YELLOW, "model": BLUE, "tokens": CYAN,
+    "render": GRAY, "time": GRAY,
+}
+BLOCK_PAIR_SEPARATOR = "+"
+# One row, one block per cell — the shape build_line and parse_blocks work in.
+DEFAULT_LAYOUT = (tuple((name,) for name in BLOCK_ORDER),)
 # "branch - task" reads as one unit, so the task block keeps the dash it had.
 BLOCK_JOINERS = {"task": " - "}
 BLOCK_SEPARATOR = " | "
@@ -1327,7 +1336,8 @@ BLOCK_LINE_SEPARATOR_ALT = ";"
 def parse_blocks(argv: list) -> tuple:
     """Block layout from the command argument, e.g. "context,cost/git,render".
 
-    Comma- or space-separated, case-insensitive; "/" starts another output line.
+    Comma- or space-separated, case-insensitive; "/" starts another output line
+    and "a+b" pairs two blocks, rendering the second one in brackets.
     Unknown names are dropped so a single typo cannot blank the line, and an
     argument with nothing usable in it falls back to the default single line.
     Names outside the default order (see EXTRA_BLOCKS) are valid too — they
@@ -1335,22 +1345,38 @@ def parse_blocks(argv: list) -> tuple:
     """
     raw = ",".join(arg for arg in argv if not arg.startswith("-"))
     if not raw.strip():
-        return (BLOCK_ORDER,)
+        return DEFAULT_LAYOUT
     layout, seen = [], set()
     normalised = raw.replace(BLOCK_LINE_SEPARATOR_ALT, BLOCK_LINE_SEPARATOR)
     for chunk in normalised.split(BLOCK_LINE_SEPARATOR):
         order = []
         for name in chunk.replace(",", " ").split():
-            name = name.lower()
-            if name in BLOCK_NAMES and name not in seen:
-                seen.add(name)  # deduplicated: rendering git twice costs two forks
-                order.append(name)
+            pair = [part for part in name.lower().split(BLOCK_PAIR_SEPARATOR) if part]
+            if not pair or any(part not in BLOCK_NAMES for part in pair):
+                continue
+            if any(part in seen for part in pair):
+                continue  # deduplicated: rendering git twice costs two forks
+            seen.update(pair)
+            order.append(tuple(pair))
         if order:
             layout.append(tuple(order))
-    return tuple(layout) or (BLOCK_ORDER,)
+    return tuple(layout) or DEFAULT_LAYOUT
 
 
-def build_line(data: dict, layout: tuple = (BLOCK_ORDER,)) -> str:
+def join_pair(pair: tuple, texts: list) -> str:
+    """First block plain, each following one bracketed — "58ms (13:43)".
+
+    The brackets take the leading block's colour so they read as part of it;
+    every text already carries its own colour and closing reset.
+    """
+    color = BLOCK_BRACKET_COLOR.get(pair[0], "")
+    out = texts[0]
+    for extra in texts[1:]:
+        out += f" {color}({RESET}{extra}{color}){RESET}" if color else f" ({extra})"
+    return out
+
+
+def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT) -> str:
     model = model_segment(data)
     workspace = data.get("workspace")
     cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
@@ -1382,20 +1408,18 @@ def build_line(data: dict, layout: tuple = (BLOCK_ORDER,)) -> str:
         "git": lambda: git_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
-        "render+time": lambda: render_time_segment(data),
+        "time": lambda: time_segment(data),
     }
 
     rendered = []
     for order in layout:
         line = ""
-        for name in order:
-            make = blocks.get(name)
-            if make is None:
+        for pair in order:
+            texts = [text for text in (blocks[name]() for name in pair if name in blocks) if text]
+            if not texts:
                 continue
-            text = make()
-            if not text:
-                continue
-            line += (BLOCK_JOINERS.get(name, BLOCK_SEPARATOR) if line else "") + text
+            joiner = BLOCK_JOINERS.get(pair[0], BLOCK_SEPARATOR) if line else ""
+            line += joiner + join_pair(pair, texts)
         if line:  # a line whose blocks all came out empty leaves no blank row
             rendered.append(line)
     return "\n".join(rendered)

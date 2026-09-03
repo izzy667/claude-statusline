@@ -25,9 +25,12 @@ z realnym rozliczeniem, gdy tabela stawek się zestarzeje. Kolejność bloków
 przyjmuje argument wywołania — `statusline.py "model,cost,git"` (przecinki lub
 spacje, wielkość liter bez znaczenia, duplikaty i nieznane nazwy pomijane, brak
 argumentu = kolejność domyślna). Nazwy: `context`, `duration`, `cost`, `model`,
-`tokens`, `lines`, `limits`, `git`, `task`, `render`, plus `render+time`
-(czas renderu, zegar lokalny i odliczanie ciepłego cache'a) — dostępny tylko po
-jawnym podaniu, poza kolejnością domyślną. Ukośnik rozpoczyna kolejną linię
+`tokens`, `lines`, `limits`, `git`, `task`, `render`, plus `time` (zegar lokalny
+i odliczanie ciepłego cache'a) — dostępny tylko po jawnym podaniu, poza
+kolejnością domyślną. Plus łączy dwa bloki w jeden segment, wstawiając drugi
+w nawias i w kolorze pierwszego: `render+time` → `58ms (13:43 ↻ 44m)`,
+`duration+time`, `model+cost`. Człony pary liczą się do deduplikacji osobno,
+więc `git,lines+git` wyrenderuje gita raz. Ukośnik rozpoczyna kolejną linię
 wyjścia: `context,model,limits/git,duration,cost,render+time`. Claude Code dzieli
 wyjście po `\n`, renderuje każdą linię osobno (przyciemnioną i obcinaną do
 szerokości terminala) i przenosi otwarte sekwencje ANSI na kolejne linie.
