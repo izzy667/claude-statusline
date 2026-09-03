@@ -45,8 +45,8 @@ timer in `time`, the reset labels in `limits`) would sit at its starting value
 for as long as you work and then jump. One render a minute keeps them moving and
 costs about 60 ms of CPU each.
 
-Requires Python 3.9+. `statusline-cmd.sh` is an older shell version kept for
-reference; it has the current prices but none of the features below.
+Requires Python 3.9+ and nothing else — the script imports only the standard
+library.
 
 ## Blocks
 

@@ -107,9 +107,6 @@ Każde to jednolinijkowy `.get()` z wyświetlaniem tylko przy obecności pola.
   interpretera w komendzie statusline (np. `python3 -S -E` — skrypt nie używa
   pakietów zewnętrznych), zysk ~10–20 ms/render. Przepisanie na język kompilowany
   nieuzasadnione przy ciepłym cache'u.
-- **`statusline-cmd.sh` to wersja legacy** — ma zaktualizowany cennik, ale żadnej
-  z powyższych poprawek (podwójne liczenie tokenów, brak cache'u, git w worktree,
-  crashe). Docelowo: usunąć albo przeportować zmiany z wersji Python.
 - **Payload statusline nie zawiera limitów per model.** Zweryfikowane w binarce
   2.1.252: `rate_limits` składane jest wyłącznie z `five_hour`, `seven_day`
   i `spend_limit`. Kubełki `seven_day_opus`, `seven_day_sonnet` i `model_scoped[]`
