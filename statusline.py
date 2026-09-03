@@ -1316,28 +1316,41 @@ BLOCK_NAMES = BLOCK_ORDER + EXTRA_BLOCKS
 # "branch - task" reads as one unit, so the task block keeps the dash it had.
 BLOCK_JOINERS = {"task": " - "}
 BLOCK_SEPARATOR = " | "
+# Starts another output line. "/" is used because the command runs through a
+# shell: an unquoted ";" would end the command there, the rest would fail to
+# resolve, and a non-zero exit makes Claude Code drop the whole line. ";" still
+# works for anyone who quotes the argument.
+BLOCK_LINE_SEPARATOR = "/"
+BLOCK_LINE_SEPARATOR_ALT = ";"
 
 
 def parse_blocks(argv: list) -> tuple:
-    """Block order from the command argument, e.g. "context,cost,model git".
+    """Block layout from the command argument, e.g. "context,cost/git,render".
 
-    Comma- or space-separated, case-insensitive; unknown names are dropped so a
-    single typo cannot blank the line, and an argument with nothing usable in it
-    falls back to the default order. Names outside the default order (see
-    EXTRA_BLOCKS) are valid too — they simply have to be asked for.
+    Comma- or space-separated, case-insensitive; "/" starts another output line.
+    Unknown names are dropped so a single typo cannot blank the line, and an
+    argument with nothing usable in it falls back to the default single line.
+    Names outside the default order (see EXTRA_BLOCKS) are valid too — they
+    simply have to be asked for.
     """
     raw = ",".join(arg for arg in argv if not arg.startswith("-"))
     if not raw.strip():
-        return BLOCK_ORDER
-    order = []
-    for name in raw.replace(",", " ").split():
-        name = name.lower()
-        if name in BLOCK_NAMES and name not in order:
-            order.append(name)  # deduplicated: rendering git twice costs two forks
-    return tuple(order) or BLOCK_ORDER
+        return (BLOCK_ORDER,)
+    layout, seen = [], set()
+    normalised = raw.replace(BLOCK_LINE_SEPARATOR_ALT, BLOCK_LINE_SEPARATOR)
+    for chunk in normalised.split(BLOCK_LINE_SEPARATOR):
+        order = []
+        for name in chunk.replace(",", " ").split():
+            name = name.lower()
+            if name in BLOCK_NAMES and name not in seen:
+                seen.add(name)  # deduplicated: rendering git twice costs two forks
+                order.append(name)
+        if order:
+            layout.append(tuple(order))
+    return tuple(layout) or (BLOCK_ORDER,)
 
 
-def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
+def build_line(data: dict, layout: tuple = (BLOCK_ORDER,)) -> str:
     model = model_segment(data)
     workspace = data.get("workspace")
     cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
@@ -1372,16 +1385,20 @@ def build_line(data: dict, order: tuple = BLOCK_ORDER) -> str:
         "render+time": lambda: render_time_segment(data),
     }
 
-    line = ""
-    for name in order:
-        make = blocks.get(name)
-        if make is None:
-            continue
-        text = make()
-        if not text:
-            continue
-        line += (BLOCK_JOINERS.get(name, BLOCK_SEPARATOR) if line else "") + text
-    return line
+    rendered = []
+    for order in layout:
+        line = ""
+        for name in order:
+            make = blocks.get(name)
+            if make is None:
+                continue
+            text = make()
+            if not text:
+                continue
+            line += (BLOCK_JOINERS.get(name, BLOCK_SEPARATOR) if line else "") + text
+        if line:  # a line whose blocks all came out empty leaves no blank row
+            rendered.append(line)
+    return "\n".join(rendered)
 
 
 def safe_print(line: str) -> None:

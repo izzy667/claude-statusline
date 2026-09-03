@@ -26,8 +26,14 @@ przyjmuje argument wywołania — `statusline.py "model,cost,git"` (przecinki lu
 spacje, wielkość liter bez znaczenia, duplikaty i nieznane nazwy pomijane, brak
 argumentu = kolejność domyślna). Nazwy: `context`, `duration`, `cost`, `model`,
 `tokens`, `lines`, `limits`, `git`, `task`, `render`, plus `render+time`
-(czas renderu z zegarem lokalnym w nawiasie) — dostępny tylko po jawnym podaniu,
-poza kolejnością domyślną. Czas sesji i czas oczekiwania są domyślnie liczone
+(czas renderu, zegar lokalny i odliczanie ciepłego cache'a) — dostępny tylko po
+jawnym podaniu, poza kolejnością domyślną. Ukośnik rozpoczyna kolejną linię
+wyjścia: `context,model,limits/git,duration,cost,render+time`. Claude Code dzieli
+wyjście po `\n`, renderuje każdą linię osobno (przyciemnioną i obcinaną do
+szerokości terminala) i przenosi otwarte sekwencje ANSI na kolejne linie.
+Świadomie **nie** średnik: komenda idzie przez powłokę, więc niecytowany `;`
+kończyłby polecenie, reszta trafiałaby do powłoki jako osobna komenda, a jej
+kod 127 kasuje całe wyjście. `;` nadal działa, jeśli argument jest w cudzysłowach. Czas sesji i czas oczekiwania są domyślnie liczone
 **dla bieżącego uruchomienia**, nie dla całego transkryptu: `total_cost_usd`
 i `total_duration_ms` zerują się przy każdym `--resume`, więc dwumiesięczny
 transkrypt zestawiałby koszt jednego przebiegu ze 170 godzinami zegara. Okno
