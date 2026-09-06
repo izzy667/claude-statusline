@@ -63,8 +63,9 @@ library.
 | `task` | `- Refactor the parser` | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
 | `render` | `56ms` | How long this render took. |
 | `time` | `13:51 ↻ 42m` | Wall clock, then minutes of warm prompt cache left. Turns yellow under 20 minutes, disappears when the cache is cold. |
+| `text` | `◆ prod` | A literal label of your own, supplied with `--text=`. See [Labels](#labels). |
 
-`time` is the only block outside the default order — ask for it by name.
+`time` and `text` sit outside the default order — ask for them by name.
 
 ## Layout
 
@@ -92,6 +93,30 @@ whose blocks all render empty is skipped rather than left blank.
 Note that the command runs through a shell. `/` is used for rows because an
 unquoted `;` would end the command there, and the failing leftovers make Claude
 Code drop the output entirely. `;` still works if the argument is quoted.
+
+### Labels
+
+`text` prints a string you supply with a `--text=` flag:
+
+```json
+"command": "python3 /path/to/statusline.py text,context,model --text='◆ prod'"
+```
+
+The flag can be repeated. Values bind to `text` blocks **by position**: the
+first block takes the first value, the second the second, and so on.
+
+```json
+"command": "python3 /path/to/statusline.py text,context,model,text --text='◆ prod' --text='eu-1'"
+```
+
+Blocks with no value left render empty and are skipped; values with no block
+left are ignored. Unlike every other block, `text` may appear more than once —
+the rest stay deduplicated, so `git` is never forked twice.
+
+Because the value travels as its own argument it may contain `,` `/` and `+`,
+which the layout argument itself cannot. Quote it if it contains spaces:
+unquoted, the shell splits `--text=◆ prod` into two arguments and only `◆`
+survives. Newlines in a value are folded to spaces — rows come from the layout.
 
 ### Refresh
 

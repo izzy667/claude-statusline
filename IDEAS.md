@@ -30,7 +30,10 @@ i odliczanie ciepłego cache'a) — dostępny tylko po jawnym podaniu, poza
 kolejnością domyślną. Plus łączy dwa bloki w jeden segment, wstawiając drugi
 w nawias i w kolorze pierwszego: `render+time` → `58ms (13:43 ↻ 44m)`,
 `duration+time`, `model+cost`. Człony pary liczą się do deduplikacji osobno,
-więc `git,lines+git` wyrenderuje gita raz. Ukośnik rozpoczyna kolejną linię
+więc `git,lines+git` wyrenderuje gita raz. Blok `text` wypisuje własną etykietę
+z flagi `--text=`; flaga może się powtarzać, a wartości wiążą się z blokami
+pozycyjnie (nadmiarowe wartości ignorowane, bloki bez wartości pomijane) — to
+jedyny blok, który wolno powtórzyć. Ukośnik rozpoczyna kolejną linię
 wyjścia: `context,model,limits/git,duration,cost,render+time`. Claude Code dzieli
 wyjście po `\n`, renderuje każdą linię osobno (przyciemnioną i obcinaną do
 szerokości terminala) i przenosi otwarte sekwencje ANSI na kolejne linie.

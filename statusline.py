@@ -1311,13 +1311,15 @@ BLOCK_ORDER = (
     "lines", "limits", "git", "task", "render",
 )
 # Blocks outside the default line — available only by naming them explicitly.
-EXTRA_BLOCKS = ("time",)
+TEXT_BLOCK = "text"  # literal label, one --text= value per occurrence
+TEXT_FLAG = "--text="
+EXTRA_BLOCKS = ("time", TEXT_BLOCK)
 BLOCK_NAMES = BLOCK_ORDER + EXTRA_BLOCKS
 # "a+b" renders b bracketed after a; the brackets take the colour of the block
 # they belong to. Blocks that paint themselves are absent here.
 BLOCK_BRACKET_COLOR = {
     "duration": MAGENTA, "cost": YELLOW, "model": BLUE, "tokens": CYAN,
-    "render": GRAY, "time": GRAY,
+    "render": GRAY, "time": GRAY, TEXT_BLOCK: GRAY,
 }
 BLOCK_PAIR_SEPARATOR = "+"
 # One row, one block per cell — the shape build_line and parse_blocks work in.
@@ -1356,7 +1358,7 @@ def parse_blocks(argv: list) -> tuple:
                 continue
             if any(part in seen for part in pair):
                 continue  # deduplicated: rendering git twice costs two forks
-            seen.update(pair)
+            seen.update(part for part in pair if part != TEXT_BLOCK)
             order.append(tuple(pair))
         if order:
             layout.append(tuple(order))
@@ -1376,7 +1378,31 @@ def join_pair(pair: tuple, texts: list) -> str:
     return out
 
 
-def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT) -> str:
+def text_block(pending: list) -> str:
+    """Next --text= value, in the same grey as the render and clock blocks.
+
+    A value carrying its own escape sequences overrides this — its reset drops
+    back to the terminal default rather than to grey.
+    """
+    value = pending.pop(0) if pending else ""
+    return f"{GRAY}{value}{RESET}" if value else ""
+
+
+def parse_texts(argv: list) -> list:
+    """Values of every --text= flag, in the order they were given.
+
+    They are matched to `text` blocks by position: the first block takes the
+    first value. Surplus values are never read, surplus blocks render empty.
+    Newlines are folded to spaces — rows come from the layout, not the label.
+    """
+    return [
+        arg[len(TEXT_FLAG):].replace("\n", " ").replace("\r", " ")
+        for arg in argv
+        if arg.startswith(TEXT_FLAG)
+    ]
+
+
+def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> str:
     model = model_segment(data)
     workspace = data.get("workspace")
     cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
@@ -1393,6 +1419,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT) -> str:
         stats = empty_totals()
     apply_process_window(data, stats)
 
+    pending_texts = list(texts)
     # Lazy on purpose: a block left out of the order is never computed, so
     # dropping "git" also drops its two subprocess calls.
     blocks = {
@@ -1409,6 +1436,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT) -> str:
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
         "time": lambda: time_segment(data),
+        TEXT_BLOCK: lambda: text_block(pending_texts),
     }
 
     rendered = []
@@ -1460,7 +1488,7 @@ def main() -> None:
             pass
 
     try:
-        line = build_line(data, parse_blocks(sys.argv[1:]))
+        line = build_line(data, parse_blocks(sys.argv[1:]), parse_texts(sys.argv[1:]))
     except Exception:
         # Last-resort guard: a broken payload must not break the statusline
         try:
