@@ -118,6 +118,17 @@ which the layout argument itself cannot. Quote it if it contains spaces:
 unquoted, the shell splits `--text=◆ prod` into two arguments and only `◆`
 survives. Newlines in a value are folded to spaces — rows come from the layout.
 
+Labels render in the same grey as `render` and `time`. The value is passed
+through untouched, so you can colour it yourself with an escape sequence —
+written `\u001b` in JSON, since `\033` means nothing there:
+
+```json
+"--text=\u001b[0;96m◆ prod\u001b[0m"
+```
+
+Your own reset returns to the terminal default rather than to grey, which only
+matters if you colour part of a label. See [Colours](#colours).
+
 ### Refresh
 
 `refreshInterval` (seconds, minimum 1) adds a periodic re-run on top of the
@@ -139,6 +150,43 @@ of silence rather than running for as long as the terminal stays open.
 | `STATUSLINE_DEBUG=1` | Writes the received payload to `debug_input.json` next to the script. |
 
 Set them in the `env` block of `settings.json`.
+
+## Colours
+
+The line uses the basic ANSI sixteen, written `\033[0;<code>m` in the script and
+`\u001b[0;<code>m` in JSON. These are palette **indices, not fixed colours**:
+each renders as whatever your terminal theme calls it, so the line follows a
+theme change and survives the dimming Claude Code applies to the whole row.
+
+| Code | Constant | Used by |
+| --- | --- | --- |
+| 30 | `BLACK` | — |
+| 31 | `RED` | context and limits at 80%+, removed lines |
+| 32 | `GREEN` | context under 50%, added lines |
+| 33 | `YELLOW` | `cost`, any window at 50%+, cache countdown under 20 minutes |
+| 34 | `BLUE` | `model` |
+| 35 | `MAGENTA` | `duration` |
+| 36 | `CYAN` | `tokens`, git branch |
+| 37 | `GRAY` | `render`, `time`, `text`, windows under 50% |
+| 90 | `DARK_GRAY` | — |
+| 91 | `BRIGHT_RED` | — |
+| 92 | `BRIGHT_GREEN` | — |
+| 93 | `BRIGHT_YELLOW` | — |
+| 94 | `BRIGHT_BLUE` | — |
+| 95 | `BRIGHT_MAGENTA` | — |
+| 96 | `BRIGHT_CYAN` | — |
+| 97 | `WHITE` | — |
+
+Every one has a constant in the script, so recolouring a block is a one-word
+edit. The eight bright entries and black are unused, which makes them the safe
+picks for a `--text=` label that should stand apart from the rest of the line.
+
+Attributes combine with a semicolon — `1` bold, `2` dim, `3` italic, `4`
+underline, `7` inverse — and background codes are the same numbers plus ten
+(`40`–`47`, `100`–`107`). Beyond the sixteen there are `\033[38;5;<0-255>m` for
+the 256-colour palette and `\033[38;2;<r>;<g>;<b>m` for 24-bit colour; both work
+in a label, but they pin an exact shade instead of following the theme, so a
+tone picked on a dark background can disappear on a light one.
 
 ## How the numbers are worked out
 

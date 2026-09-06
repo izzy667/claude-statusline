@@ -17,7 +17,12 @@ from datetime import datetime
 
 START_TIME = time.perf_counter()  # for the trailing render-time segment
 
+# The basic ANSI sixteen. These are palette indices, not fixed colours: each one
+# renders as whatever the terminal theme calls it, which is why the line follows
+# a theme change and survives the dimming Claude Code applies to it. The bright
+# half is unused by the blocks below and free for --text= labels.
 RESET = "\033[0m"
+BLACK = "\033[0;30m"
 RED = "\033[0;31m"
 GREEN = "\033[0;32m"
 YELLOW = "\033[0;33m"
@@ -25,6 +30,14 @@ BLUE = "\033[0;34m"
 MAGENTA = "\033[0;35m"
 CYAN = "\033[0;36m"
 GRAY = "\033[0;37m"
+DARK_GRAY = "\033[0;90m"
+BRIGHT_RED = "\033[0;91m"
+BRIGHT_GREEN = "\033[0;92m"
+BRIGHT_YELLOW = "\033[0;93m"
+BRIGHT_BLUE = "\033[0;94m"
+BRIGHT_MAGENTA = "\033[0;95m"
+BRIGHT_CYAN = "\033[0;96m"
+WHITE = "\033[0;97m"
 
 # Tiers: (match key, family label, (input, output) rate per MTok).
 # Cache multipliers on the input rate: 5m write 1.25x, 1h write 2x, read 0.1x.
