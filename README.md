@@ -50,22 +50,24 @@ library.
 
 ## Blocks
 
-| Block | Example | What it shows |
-| --- | --- | --- |
-| `context` | `483K/1M (48%)` | Context window used vs. its size. Green, yellow from 50%, red from 80%. Totals switch to `M` on the right side of the slash for 1M windows. |
-| `duration` | `5h53m (⧗ 1h45m) / 7d` | Session time of the **current run**, with idle breaks over an hour removed. `⧗` is the part spent waiting for the model, always contained in the figure before it. `/ 7d` appears only on a resumed session and gives the whole transcript's total. |
-| `cost` | `$67 ($11/h)` | `cost.total_cost_usd` from the payload, plus burn rate per hour of active time. Hidden below five minutes of session. `n/a` until the first API response. |
-| `model` | `Opus 5 E/xhigh ⚡` | Model name, reasoning effort, `⚡` while fast mode is on. |
-| `tokens` | `↓98.6M ↑340.4K C:96%` | Cumulative input (including cache reads and writes) and output tokens, and the share of input served from cache. |
-| `lines` | `+140/-40` | Lines Claude added and removed this session. |
-| `limits` | `2h:21% 18h:14% F:6%` | Plan usage windows. The label is the time left until that window resets, so `2h:21%` means the 5-hour window is 21% used and resets in two hours. Single letters are per-model weekly buckets (`F` = Fable). Grey, yellow from 50%, red from 80%. |
-| `git` | `main ● ~1 (+44/-20)` | Branch, working-tree state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. |
-| `task` | `- Refactor the parser` | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
-| `render` | `56ms` | How long this render took. |
-| `time` | `13:51 ↻ 42m` | Wall clock, then minutes of warm prompt cache left. Turns yellow under 20 minutes, disappears when the cache is cold. |
-| `text` | `◆ prod` | A literal label of your own, supplied with `--text=`. See [Labels](#labels). |
+| Block | Example | Colour | What it shows |
+| --- | --- | --- | --- |
+| `context` | `483K/1M (48%)` | green, yellow from 50%, red from 80% | Context window used vs. its size. Totals switch to `M` on the right side of the slash for 1M windows. |
+| `duration` | `5h53m (⧗ 1h45m) / 7d` | magenta | Session time of the **current run**, with idle breaks over an hour removed. `⧗` is the part spent waiting for the model, always contained in the figure before it. `/ 7d` appears only on a resumed session and gives the whole transcript's total. |
+| `cost` | `$67 ($11/h)` | yellow | `cost.total_cost_usd` from the payload, plus burn rate per hour of active time. Hidden below five minutes of session. `n/a` until the first API response. |
+| `model` | `Opus 5 E/xhigh ⚡` | blue | Model name, reasoning effort, `⚡` while fast mode is on. |
+| `tokens` | `↓98.6M ↑340.4K C:96%` | cyan | Cumulative input (including cache reads and writes) and output tokens, and the share of input served from cache. |
+| `lines` | `+140/-40` | green and red | Lines Claude added and removed this session. |
+| `limits` | `2h:21% 18h:14% F:6%` | grey, yellow from 50%, red from 80%, per window | Plan usage windows. The label is the time left until that window resets, so `2h:21%` means the 5-hour window is 21% used and resets in two hours. Single letters are per-model weekly buckets (`F` = Fable). |
+| `git` | `main ● ~1 (+44/-20)` | cyan, delta green and red | Branch, working-tree state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. |
+| `task` | `- Refactor the parser` | none, terminal default | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
+| `render` | `56ms` | grey | How long this render took. |
+| `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. |
+| `text` | `◆ prod` | grey | A literal label of your own, supplied with `--text=`. See [Labels](#labels). |
 
-`time` and `text` sit outside the default order — ask for them by name.
+`time` and `text` sit outside the default order — ask for them by name. Any block
+can be repainted from the layout argument with `:colour`, see
+[Colours](#colours).
 
 ## Layout
 
@@ -81,6 +83,7 @@ what order:
 | `a,b,c` or `a b c` | Order of blocks. Comma or space, case-insensitive. |
 | `a/b` | Starts another output row. Claude Code renders each row separately. |
 | `a+b` | Pairs two blocks: `b` is bracketed after `a`, in `a`'s colour. `render+time` gives `56ms (13:51 ↻ 42m)`. |
+| `a:colour` | Repaints one block, e.g. `time:black,context:green`. See [Colours](#colours). |
 
 Without the argument the default order applies:
 `context, duration, cost, model, tokens, lines, limits, git, task, render`.
@@ -161,12 +164,12 @@ theme change and survives the dimming Claude Code applies to the whole row.
 | Code | Constant | Used by |
 | --- | --- | --- |
 | 30 | `BLACK` | — |
-| 31 | `RED` | context and limits at 80%+, removed lines |
-| 32 | `GREEN` | context under 50%, added lines |
-| 33 | `YELLOW` | `cost`, any window at 50%+, cache countdown under 20 minutes |
+| 31 | `RED` | `context` and `limits` at 80%+, the removed half of `lines` and of the git delta |
+| 32 | `GREEN` | `context` under 50%, the added half of `lines` and of the git delta |
+| 33 | `YELLOW` | `cost`, any window at 50%+, the cache countdown under 20 minutes |
 | 34 | `BLUE` | `model` |
 | 35 | `MAGENTA` | `duration` |
-| 36 | `CYAN` | `tokens`, git branch |
+| 36 | `CYAN` | `tokens`, the git branch |
 | 37 | `GRAY` | `render`, `time`, `text`, windows under 50% |
 | 90 | `DARK_GRAY` | — |
 | 91 | `BRIGHT_RED` | — |
@@ -177,9 +180,28 @@ theme change and survives the dimming Claude Code applies to the whole row.
 | 96 | `BRIGHT_CYAN` | — |
 | 97 | `WHITE` | — |
 
-Every one has a constant in the script, so recolouring a block is a one-word
-edit. The eight bright entries and black are unused, which makes them the safe
-picks for a `--text=` label that should stand apart from the rest of the line.
+`task` is the one block with no colour of its own; it takes the terminal
+default.
+
+Every one has a constant in the script, and any of them can be applied to a
+block straight from the layout argument by appending `:name`:
+
+```json
+"command": "python3 /path/to/statusline.py time:black,context:green,model:bright_cyan"
+```
+
+Names are case-insensitive, `grey` and `gray` both work, and a repainted block
+is stripped of the colours it picked for itself first — so `context:green` stays
+green at any fill level instead of turning yellow and red, and `git:white` paints
+the branch and the line delta alike. In a pair the leading block's colour also
+decides the brackets, so `render:cyan+time` brackets the clock in cyan.
+
+An unrecognised colour is ignored and the block keeps its default, on the same
+principle that a typo should not blank part of the line; an unrecognised block
+name still drops the whole token.
+
+The eight bright entries and black are unused by default, which makes them the
+safe picks for a repaint or for a `--text=` label that should stand apart.
 
 Attributes combine with a semicolon — `1` bold, `2` dim, `3` italic, `4`
 underline, `7` inverse — and background codes are the same numbers plus ten

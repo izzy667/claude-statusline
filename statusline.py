@@ -235,7 +235,7 @@ def model_mix_segment(current: str, stats: dict) -> str:
         for label, usd in others[:MODEL_MIX_MAX]
         if usd * 100 / total >= MODEL_MIX_MIN_PCT
     ]
-    return f" {' '.join(parts)}" if parts else ""
+    return f"{GRAY} {' '.join(parts)}{RESET}" if parts else ""
 
 
 # --- Context window ---
@@ -1335,6 +1335,17 @@ BLOCK_BRACKET_COLOR = {
     "render": GRAY, "time": GRAY, TEXT_BLOCK: GRAY,
 }
 BLOCK_PAIR_SEPARATOR = "+"
+BLOCK_COLOR_SEPARATOR = ":"  # "time:black" repaints one block
+# Colour names accepted in the layout. A repainted block is stripped of the
+# colours it chose for itself first, so the override is the only one left.
+COLORS = {
+    "black": BLACK, "red": RED, "green": GREEN, "yellow": YELLOW, "blue": BLUE,
+    "magenta": MAGENTA, "cyan": CYAN, "gray": GRAY, "grey": GRAY,
+    "dark_gray": DARK_GRAY, "dark_grey": DARK_GRAY, "bright_red": BRIGHT_RED,
+    "bright_green": BRIGHT_GREEN, "bright_yellow": BRIGHT_YELLOW,
+    "bright_blue": BRIGHT_BLUE, "bright_magenta": BRIGHT_MAGENTA,
+    "bright_cyan": BRIGHT_CYAN, "white": WHITE,
+}
 # One row, one block per cell — the shape build_line and parse_blocks work in.
 DEFAULT_LAYOUT = (tuple((name,) for name in BLOCK_ORDER),)
 # "branch - task" reads as one unit, so the task block keeps the dash it had.
@@ -1346,6 +1357,37 @@ BLOCK_SEPARATOR = " | "
 # works for anyone who quotes the argument.
 BLOCK_LINE_SEPARATOR = "/"
 BLOCK_LINE_SEPARATOR_ALT = ";"
+
+
+def strip_color(text: str) -> str:
+    """Drop SGR sequences so a block can be repainted in a single colour."""
+    out = []
+    index = 0
+    while index < len(text):
+        if text.startswith("\033[", index):
+            end = text.find("m", index)
+            if end != -1:
+                index = end + 1
+                continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
+
+
+def block_name(token: str) -> str:
+    return token.partition(BLOCK_COLOR_SEPARATOR)[0]
+
+
+def normalise_block(token: str) -> str | None:
+    """Validate one "name" or "name:colour" token; None when the name is unknown.
+
+    An unrecognised colour is dropped rather than rejected — a typo there should
+    cost the colour, not the whole block.
+    """
+    name, _, color = token.partition(BLOCK_COLOR_SEPARATOR)
+    if name not in BLOCK_NAMES:
+        return None
+    return f"{name}{BLOCK_COLOR_SEPARATOR}{color}" if color in COLORS else name
 
 
 def parse_blocks(argv: list) -> tuple:
@@ -1367,24 +1409,25 @@ def parse_blocks(argv: list) -> tuple:
         order = []
         for name in chunk.replace(",", " ").split():
             pair = [part for part in name.lower().split(BLOCK_PAIR_SEPARATOR) if part]
-            if not pair or any(part not in BLOCK_NAMES for part in pair):
+            pair = [normalise_block(part) for part in pair]
+            if not pair or any(part is None for part in pair):
                 continue
-            if any(part in seen for part in pair):
+            heads = [block_name(part) for part in pair]
+            if any(head in seen for head in heads):
                 continue  # deduplicated: rendering git twice costs two forks
-            seen.update(part for part in pair if part != TEXT_BLOCK)
+            seen.update(head for head in heads if head != TEXT_BLOCK)
             order.append(tuple(pair))
         if order:
             layout.append(tuple(order))
     return tuple(layout) or DEFAULT_LAYOUT
 
 
-def join_pair(pair: tuple, texts: list) -> str:
+def join_pair(color: str, texts: list) -> str:
     """First block plain, each following one bracketed — "58ms (13:43)".
 
     The brackets take the leading block's colour so they read as part of it;
     every text already carries its own colour and closing reset.
     """
-    color = BLOCK_BRACKET_COLOR.get(pair[0], "")
     out = texts[0]
     for extra in texts[1:]:
         out += f" {color}({RESET}{extra}{color}){RESET}" if color else f" ({extra})"
@@ -1439,9 +1482,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
         "context": lambda: context_segment(data),
         "duration": lambda: f"{MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}",
         "cost": lambda: f"{YELLOW}{cost_segment(data, stats)}{RESET}",
-        "model": lambda: (
-            f"{BLUE}{model}{RESET}{GRAY}{model_mix_segment(tier[0], stats)}{RESET}"
-        ),
+        "model": lambda: f"{BLUE}{model}{RESET}{model_mix_segment(tier[0], stats)}",
         "tokens": lambda: f"{CYAN}{tokens_segment(stats)}{RESET}",
         "lines": lambda: lines_segment(data),
         "limits": lambda: rate_limits_segment(data, stats),
@@ -1456,11 +1497,22 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
     for order in layout:
         line = ""
         for pair in order:
-            texts = [text for text in (blocks[name]() for name in pair if name in blocks) if text]
+            texts = []
+            for token in pair:
+                name, _, color = token.partition(BLOCK_COLOR_SEPARATOR)
+                make = blocks.get(name)
+                text = make() if make else ""
+                if not text:
+                    continue
+                if color:
+                    text = f"{COLORS[color]}{strip_color(text)}{RESET}"
+                texts.append(text)
             if not texts:
                 continue
-            joiner = BLOCK_JOINERS.get(pair[0], BLOCK_SEPARATOR) if line else ""
-            line += joiner + join_pair(pair, texts)
+            head, _, head_color = pair[0].partition(BLOCK_COLOR_SEPARATOR)
+            bracket = COLORS[head_color] if head_color else BLOCK_BRACKET_COLOR.get(head, "")
+            joiner = BLOCK_JOINERS.get(head, BLOCK_SEPARATOR) if line else ""
+            line += joiner + join_pair(bracket, texts)
         if line:  # a line whose blocks all came out empty leaves no blank row
             rendered.append(line)
     return "\n".join(rendered)

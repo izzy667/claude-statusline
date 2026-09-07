@@ -33,7 +33,10 @@ w nawias i w kolorze pierwszego: `render+time` → `58ms (13:43 ↻ 44m)`,
 więc `git,lines+git` wyrenderuje gita raz. Blok `text` wypisuje własną etykietę
 z flagi `--text=`; flaga może się powtarzać, a wartości wiążą się z blokami
 pozycyjnie (nadmiarowe wartości ignorowane, bloki bez wartości pomijane) — to
-jedyny blok, który wolno powtórzyć. Ukośnik rozpoczyna kolejną linię
+jedyny blok, który wolno powtórzyć. Dwukropek nadpisuje kolor bloku
+(`time:black,context:green`) — nadpisany blok jest najpierw pozbawiany własnych
+sekwencji, więc progi kolorów przestają działać, a nieznana nazwa koloru jest
+ignorowana zamiast unieważniać blok. Ukośnik rozpoczyna kolejną linię
 wyjścia: `context,model,limits/git,duration,cost,render+time`. Claude Code dzieli
 wyjście po `\n`, renderuje każdą linię osobno (przyciemnioną i obcinaną do
 szerokości terminala) i przenosi otwarte sekwencje ANSI na kolejne linie.
