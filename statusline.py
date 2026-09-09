@@ -1179,19 +1179,59 @@ def duration_segment(data: dict, transcript_path: str, stats: dict) -> str:
     return elapsed + transcript_span(stats, seconds)
 
 
-# --- Git ---
+# --- Version control ---
 
-def find_git_root(cwd: str) -> str | None:
-    """Nearest ancestor containing .git — a dir (repo) or a file (worktree/submodule)."""
+# One budget for the whole block, shared by the backends it tries: a detected
+# but stalled first backend must not add its timeout on top of the next one's.
+VCS_BUDGET_S = 3.0
+GIT_TIMEOUT_S = 1.5  # per call, and git makes two
+# One fork, not git's two, so it can afford to wait longer on a single answer;
+# a Plastic server is often remote, where git's 1.5s would clip a healthy one.
+PLASTIC_TIMEOUT_S = 2.5
+# Plastic change codes mapped onto the three counters the git block already
+# shows. CO is a file checked out but not yet edited: no git equivalent, and
+# still a pending change, so it counts as modified.
+PLASTIC_ADDED = ("AD", "PR")  # added to source control, or private (untracked)
+PLASTIC_DELETED = ("DE", "LD")  # removed from control, or deleted on disk only
+PLASTIC_MODIFIED = ("CH", "CO", "MV", "LM", "CP", "RP")
+
+
+def find_root(cwd: str, marker: str) -> str | None:
+    """Nearest ancestor holding `marker` — for .git a dir (repo) or file (worktree)."""
     path = os.path.abspath(cwd)
     while True:
-        if os.path.exists(os.path.join(path, ".git")):
+        if os.path.exists(os.path.join(path, marker)):
             return path
         parent = os.path.dirname(path)
         if parent == path:
             return None
         path = parent
 
+
+def call_timeout(deadline: float, cap: float) -> float:
+    """Per-call cap, shortened to whatever is left of the block's budget.
+
+    Never zero: a call that gets no time still has to be made and fail, and a
+    0 timeout raises before the fork rather than after it.
+    """
+    return max(0.1, min(cap, deadline - time.monotonic()))
+
+
+def dirty_mark(added: int, modified: int, deleted: int) -> str:
+    """Working-copy state, identical for every backend: ○ clean, ● and counts dirty."""
+    if not (added or modified or deleted):
+        return " ○"
+    mark = " ●"
+    if added:
+        mark += f" +{added}"
+    if modified:
+        mark += f" ~{modified}"
+    if deleted:
+        mark += f" -{deleted}"
+    return mark
+
+
+# --- Git ---
 
 def parse_branch_header(header: str) -> str:
     # "main...origin/main [ahead 1]" | "main" | "HEAD (no branch)" | "No commits yet on main"
@@ -1202,16 +1242,16 @@ def parse_branch_header(header: str) -> str:
     return header.split("...", 1)[0]
 
 
-def git_segment(cwd: str) -> str:
-    if find_git_root(cwd) is None:
-        return ""
+def git_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
     import subprocess
 
+    deadline = time.monotonic() + budget
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
     try:
         out = subprocess.check_output(
             ["git", "-c", "core.fileMode=false", "status", "--porcelain", "-b"],
-            cwd=cwd, stderr=subprocess.DEVNULL, text=True, timeout=1.5, env=env,
+            cwd=cwd, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            timeout=call_timeout(deadline, GIT_TIMEOUT_S), env=env,
         )
     except Exception:
         return ""  # not a repo, git missing, or git timed out
@@ -1231,27 +1271,19 @@ def git_segment(cwd: str) -> str:
             deleted += 1
         elif x in "MRC" or y in "MRC":
             modified += 1
-    if added or modified or deleted:
-        dirty = " ●"
-        if added:
-            dirty += f" +{added}"
-        if modified:
-            dirty += f" ~{modified}"
-        if deleted:
-            dirty += f" -{deleted}"
-    else:
-        dirty = " ○"
-    return f"{CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env)}"
+    dirty = dirty_mark(added, modified, deleted)
+    return f"{CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env, deadline)}"
 
 
-def workspace_diff(cwd: str, env: dict) -> str:
+def workspace_diff(cwd: str, env: dict, deadline: float) -> str:
     """Uncommitted line delta vs HEAD (staged + unstaged) — zeroes after commit."""
     import subprocess
 
     try:
         out = subprocess.check_output(
             ["git", "-c", "core.fileMode=false", "diff", "--numstat", "HEAD"],
-            cwd=cwd, stderr=subprocess.DEVNULL, text=True, timeout=1.5, env=env,
+            cwd=cwd, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            timeout=call_timeout(deadline, GIT_TIMEOUT_S), env=env,
         )
     except Exception:
         return ""  # e.g. repo without commits yet, or git timed out
@@ -1266,6 +1298,100 @@ def workspace_diff(cwd: str, env: dict) -> str:
     if added == 0 and removed == 0:
         return ""
     return f" ({GREEN}+{added}{RESET}/{RED}-{removed}{RESET})"
+
+
+# --- Plastic SCM (Unity Version Control) ---
+
+def plastic_branch(config_type: str, config_name: str) -> str:
+    """Workspace configuration as a branch-shaped label.
+
+    "/main/fix@repo@server" is a branch and reads "main/fix"; a workspace
+    pinned to a changeset or a label carries no branch, so it shows the spec
+    instead — the same role git's "HEAD" plays when detached.
+    """
+    name = config_name.split("@", 1)[0]  # @ separates repo and server, never in a name
+    if not name:
+        return ""
+    if config_type == "Changeset":
+        return f"cs:{name}"
+    if config_type == "Label":
+        return f"lb:{name}"
+    return name.lstrip("/")
+
+
+def plastic_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
+    """Plastic counterpart of git_segment, and deliberately the same shape.
+
+    One `cm status --xml` carries both the workspace configuration and every
+    pending change, so this costs a single fork where git needs two. No line
+    delta follows it: `cm diff` only accepts a changeset, label or shelve spec,
+    a working copy is not addressable, and reconstructing one would mean a
+    `cm cat` fork per changed file.
+    """
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    try:
+        # Bytes, not text=True: the payload declares its own encoding, which
+        # ElementTree honours and a locale-decoded str would collide with.
+        out = subprocess.check_output(
+            ["cm", "status", "--xml", "--encoding=utf-8", "--nomergesinfo"],
+            cwd=cwd, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=call_timeout(time.monotonic() + budget, PLASTIC_TIMEOUT_S),
+        )
+    except Exception:
+        return ""  # cm missing, no server, or the call timed out
+    try:
+        root = ET.fromstring(out)
+    except Exception:
+        return ""
+    # StatusOutput holds WkConfigType/WkConfigName directly and nests the
+    # changes one level down, under Changes — hence findtext here, iter below.
+    branch = plastic_branch(root.findtext("WkConfigType", ""), root.findtext("WkConfigName", ""))
+    if not branch:
+        return ""
+
+    added = modified = deleted = 0
+    for change in root.iter("Change"):
+        code = (change.findtext("Type") or "").upper()
+        if code in PLASTIC_ADDED:
+            added += 1
+        elif code in PLASTIC_DELETED:
+            deleted += 1
+        elif code in PLASTIC_MODIFIED:
+            modified += 1
+    return f"{CYAN}{branch}{dirty_mark(added, modified, deleted)}{RESET}"
+
+
+# --- Backend choice ---
+
+# Two backends behind one block, tried in this order. Plastic leads, so a Unity
+# project kept in Plastic reports the changes `cm ci` would commit even when a
+# .git directory sits next to it.
+VCS_BACKENDS = (
+    (".plastic", plastic_segment),
+    (".git", git_segment),
+)
+
+
+def vcs_segment(cwd: str) -> str:
+    """Branch and working-copy state from whichever backend claims the tree.
+
+    A backend that is found but cannot answer — client not installed, server
+    unreachable, call timed out — hands over to the next one rather than
+    blanking the block.
+    """
+    deadline = time.monotonic() + VCS_BUDGET_S
+    for marker, segment in VCS_BACKENDS:
+        if find_root(cwd, marker) is None:
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break  # the first backend ate the budget; a second wait helps nobody
+        line = segment(cwd, left)
+        if line:
+            return line
+    return ""
 
 
 # --- Task label ---
@@ -1477,7 +1603,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
 
     pending_texts = list(texts)
     # Lazy on purpose: a block left out of the order is never computed, so
-    # dropping "git" also drops its two subprocess calls.
+    # dropping "git" also drops the subprocess calls its backend would make.
     blocks = {
         "context": lambda: context_segment(data),
         "duration": lambda: f"{MAGENTA}{duration_segment(data, transcript_path, stats)}{RESET}",
@@ -1486,7 +1612,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
         "tokens": lambda: f"{CYAN}{tokens_segment(stats)}{RESET}",
         "lines": lambda: lines_segment(data),
         "limits": lambda: rate_limits_segment(data, stats),
-        "git": lambda: git_segment(cwd) if cwd else "",
+        "git": lambda: vcs_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
         "time": lambda: time_segment(data),

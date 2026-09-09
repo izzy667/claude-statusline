@@ -59,7 +59,7 @@ library.
 | `tokens` | `↓98.6M ↑340.4K C:96%` | cyan | Cumulative input (including cache reads and writes) and output tokens, and the share of input served from cache. |
 | `lines` | `+140/-40` | green and red | Lines Claude added and removed this session. |
 | `limits` | `2h:21% 18h:14% F:6%` | grey, yellow from 50%, red from 80%, per window | Plan usage windows. The label is the time left until that window resets, so `2h:21%` means the 5-hour window is 21% used and resets in two hours. Single letters are per-model weekly buckets (`F` = Fable). |
-| `git` | `main ● ~1 (+44/-20)` | cyan, delta green and red | Branch, working-tree state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. |
+| `git` | `main ● ~1 (+44/-20)` | cyan, delta green and red | Branch, working-copy state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. Reads git or Plastic SCM, whichever holds the directory — see [Version control](#version-control). |
 | `task` | `- Refactor the parser` | none, terminal default | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
 | `render` | `56ms` | grey | How long this render took. |
 | `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. |
@@ -169,7 +169,7 @@ theme change and survives the dimming Claude Code applies to the whole row.
 | 33 | `YELLOW` | `cost`, any window at 50%+, the cache countdown under 20 minutes |
 | 34 | `BLUE` | `model` |
 | 35 | `MAGENTA` | `duration` |
-| 36 | `CYAN` | `tokens`, the git branch |
+| 36 | `CYAN` | `tokens`, the branch in `git` |
 | 37 | `GRAY` | `render`, `time`, `text`, windows under 50% |
 | 90 | `DARK_GRAY` | — |
 | 91 | `BRIGHT_RED` | — |
@@ -278,6 +278,45 @@ bumped whenever the rate tables change, so stale prices cannot survive.
 
 Cost of a full rescan on a 691 MB transcript: about 3 seconds. Warm renders are
 50–70 ms, dominated by Python interpreter startup.
+
+### Version control
+
+The `git` block covers two backends and there is no second block to configure:
+the working copy that holds the current directory decides which one answers.
+Detection walks the ancestors for a marker and takes the first hit in this
+order, so a directory carrying both reports Plastic:
+
+| Order | Marker | Backend |
+| --- | --- | --- |
+| 1 | `.plastic` | Plastic SCM / Unity Version Control, via `cm` |
+| 2 | `.git` | git — a directory (repo) or a file (worktree, submodule) |
+
+A backend that is found but cannot answer — client not installed, server
+unreachable, the call timed out — hands over to the next one rather than
+blanking the block, so a fake `.plastic` beside a real repo still shows the git
+branch.
+
+Both render the same shape. Plastic reports its branch without the leading
+slash and without the `@repo@server` suffix, `main/fix` for `/main/fix@x@y`; a
+workspace pinned to a changeset or a label has no branch and shows `cs:12` or
+`lb:v1.0`, which is the role `HEAD` plays in a detached git repo. The three
+counters map straight across: `AD` and `PR` are added, `DE` and `LD` deleted,
+and `CH`, `CO`, `MV`, `LM`, `CP`, `RP` modified — `CO` included, because a file
+checked out and not yet edited is still something `cm ci` would commit.
+
+The one difference is the trailing line delta, which git only has because
+`git diff --numstat HEAD` exists. `cm diff` takes a changeset, label or shelve
+spec; a working copy is not addressable, and rebuilding the delta would cost a
+`cm cat` fork per changed file. So Plastic prints the branch and the counters
+and stops there.
+
+Cost is one fork for Plastic against git's two, but `cm` is a heavier client:
+about 350 ms for `cm status --xml` where git answers in tens of milliseconds.
+That is also why a single Plastic call may take 2.5 s against git's 1.5 s — a
+remote Plastic server is common, and one slow answer should not cost the block.
+The whole block still shares one 3 s budget, and each call is capped at what is
+left of it, so a detected-but-stalled backend cannot add its timeout on top of
+the next one's: the worst case is what git alone already cost.
 
 ## Files it writes
 
