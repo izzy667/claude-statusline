@@ -1194,6 +1194,7 @@ PLASTIC_TIMEOUT_S = 2.5
 PLASTIC_ADDED = ("AD", "PR")  # added to source control, or private (untracked)
 PLASTIC_DELETED = ("DE", "LD")  # removed from control, or deleted on disk only
 PLASTIC_MODIFIED = ("CH", "CO", "MV", "LM", "CP", "RP")
+GIT_HASH_LEN = 7  # what `git rev-parse --short` prints by default
 
 
 def find_root(cwd: str, marker: str) -> str | None:
@@ -1217,6 +1218,13 @@ def call_timeout(deadline: float, cap: float) -> float:
     return max(0.1, min(cap, deadline - time.monotonic()))
 
 
+def head_mark(ref: str) -> str:
+    """Which commit the working copy sits on: " (a3f9c21)" for git, " (cs:211)"
+    for Plastic. Empty when there is nothing to point at, e.g. a repo without
+    commits yet."""
+    return f" ({ref})" if ref else ""
+
+
 def dirty_mark(added: int, modified: int, deleted: int) -> str:
     """Working-copy state, identical for every backend: ○ clean, ● and counts dirty."""
     if not (added or modified or deleted):
@@ -1233,14 +1241,11 @@ def dirty_mark(added: int, modified: int, deleted: int) -> str:
 
 # --- Git ---
 
-def parse_branch_header(header: str) -> str:
-    # "main...origin/main [ahead 1]" | "main" | "HEAD (no branch)" | "No commits yet on main"
-    if header.startswith("No commits yet on "):
-        return header[len("No commits yet on "):]
-    if header.startswith("HEAD ("):  # detached; a branch named "HEAD-x" must NOT match
-        return "HEAD"
-    return header.split("...", 1)[0]
-
+# Headers of `git status --porcelain=v2 -b`. v2 over v1 for one reason: it
+# names the commit the working copy sits on, so the hash costs no extra fork.
+BRANCH_HEAD = "# branch.head "
+BRANCH_OID = "# branch.oid "
+CHANGE_RECORDS = ("1 ", "2 ", "u ")  # ordinary, renamed/copied, unmerged
 
 def git_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
     import subprocess
@@ -1249,30 +1254,40 @@ def git_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
     try:
         out = subprocess.check_output(
-            ["git", "-c", "core.fileMode=false", "status", "--porcelain", "-b"],
+            ["git", "-c", "core.fileMode=false", "status", "--porcelain=v2", "-b"],
             cwd=cwd, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
             timeout=call_timeout(deadline, GIT_TIMEOUT_S), env=env,
         )
     except Exception:
         return ""  # not a repo, git missing, or git timed out
-    lines = out.splitlines()
-    if not lines or not lines[0].startswith("## "):
-        return ""
-    branch = parse_branch_header(lines[0][3:])
-
+    branch = oid = ""
     added = modified = deleted = 0
-    for status_line in lines[1:]:
-        if len(status_line) < 2:
-            continue
-        x, y = status_line[0], status_line[1]
-        if status_line.startswith("??") or x == "A":
+    for status_line in out.splitlines():
+        if status_line.startswith(BRANCH_HEAD):
+            branch = status_line[len(BRANCH_HEAD):]
+            if branch == "(detached)":
+                branch = "HEAD"
+        elif status_line.startswith(BRANCH_OID):
+            oid = status_line[len(BRANCH_OID):]
+            if oid == "(initial)":  # no commits yet, so no hash to show
+                oid = ""
+        elif status_line.startswith("? "):
             added += 1
-        elif x == "D" or y == "D":
-            deleted += 1
-        elif x in "MRC" or y in "MRC":
-            modified += 1
+        elif status_line[:2] in CHANGE_RECORDS:
+            # "1 XY ...", "2 XY ..." and "u XY ..." all carry XY in the same
+            # place, and its letters mean what they mean in the v1 format.
+            x, y = status_line[2:3], status_line[3:4]
+            if x == "A":
+                added += 1
+            elif x == "D" or y == "D":
+                deleted += 1
+            elif x in "MRC" or y in "MRC":
+                modified += 1
+    if not branch:
+        return ""
     dirty = dirty_mark(added, modified, deleted)
-    return f"{CYAN}{branch}{dirty}{RESET}{workspace_diff(cwd, env, deadline)}"
+    head = head_mark(oid[:GIT_HASH_LEN])
+    return f"{CYAN}{branch}{head}{dirty}{RESET}{workspace_diff(cwd, env, deadline)}"
 
 
 def workspace_diff(cwd: str, env: dict, deadline: float) -> str:
@@ -1350,6 +1365,11 @@ def plastic_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
     branch = plastic_branch(root.findtext("WkConfigType", ""), root.findtext("WkConfigName", ""))
     if not branch:
         return ""
+    # Plastic's counterpart of a commit hash, already in the same document.
+    changeset = (root.findtext("WorkspaceStatus/Status/Changeset") or "").strip()
+    head = f"cs:{changeset}" if changeset else ""
+    if head == branch:  # pinned to that changeset — the branch label already says it
+        head = ""
 
     added = modified = deleted = 0
     for change in root.iter("Change"):
@@ -1360,7 +1380,7 @@ def plastic_segment(cwd: str, budget: float = VCS_BUDGET_S) -> str:
             deleted += 1
         elif code in PLASTIC_MODIFIED:
             modified += 1
-    return f"{CYAN}{branch}{dirty_mark(added, modified, deleted)}{RESET}"
+    return f"{CYAN}{branch}{head_mark(head)}{dirty_mark(added, modified, deleted)}{RESET}"
 
 
 # --- Backend choice ---

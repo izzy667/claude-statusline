@@ -59,7 +59,7 @@ library.
 | `tokens` | `↓98.6M ↑340.4K C:96%` | cyan | Cumulative input (including cache reads and writes) and output tokens, and the share of input served from cache. |
 | `lines` | `+140/-40` | green and red | Lines Claude added and removed this session. |
 | `limits` | `2h:21% 18h:14% F:6%` | grey, yellow from 50%, red from 80%, per window | Plan usage windows. The label is the time left until that window resets, so `2h:21%` means the 5-hour window is 21% used and resets in two hours. Single letters are per-model weekly buckets (`F` = Fable). |
-| `git` | `main ● ~1 (+44/-20)` | cyan, delta green and red | Branch, working-copy state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. Reads git or Plastic SCM, whichever holds the directory — see [Version control](#version-control). |
+| `git` | `main (a3f9c21) ● ~1 (+44/-20)` | cyan, delta green and red | Branch, the commit the working copy sits on, its state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. Reads git or Plastic SCM, whichever holds the directory — see [Version control](#version-control). |
 | `task` | `- Refactor the parser` | none, terminal default | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
 | `render` | `56ms` | grey | How long this render took. |
 | `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. |
@@ -303,6 +303,15 @@ workspace pinned to a changeset or a label has no branch and shows `cs:12` or
 counters map straight across: `AD` and `PR` are added, `DE` and `LD` deleted,
 and `CH`, `CO`, `MV`, `LM`, `CP`, `RP` modified — `CO` included, because a file
 checked out and not yet edited is still something `cm ci` would commit.
+
+The bracket after the branch is the commit the working copy sits on: a
+seven-character hash for git, `(cs:211)` for Plastic. Neither costs a fork of
+its own — git's comes from `status --porcelain=v2`, whose header names the
+commit the v1 format leaves out, and Plastic's is already in the same XML. It
+disappears where it would say nothing: a git repo with no commits yet, and a
+Plastic workspace pinned to a changeset, whose branch label is that changeset
+already. A label-pinned workspace keeps it, since `lb:v1.0 (cs:1)` tells you
+where the label points.
 
 The one difference is the trailing line delta, which git only has because
 `git diff --numstat HEAD` exists. `cm diff` takes a changeset, label or shelve
