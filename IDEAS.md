@@ -36,7 +36,11 @@ pozycyjnie (nadmiarowe wartości ignorowane, bloki bez wartości pomijane) — t
 jedyny blok, który wolno powtórzyć. Dwukropek nadpisuje kolor bloku
 (`time:black,context:green`) — nadpisany blok jest najpierw pozbawiany własnych
 sekwencji, więc progi kolorów przestają działać, a nieznana nazwa koloru jest
-ignorowana zamiast unieważniać blok. Ukośnik rozpoczyna kolejną linię
+ignorowana zamiast unieważniać blok. Kubełki per model są liczone osobno dla
+każdego konta: sesja z innym `CLAUDE_CONFIG_DIR` czyta token z wpisu Keychain
+`Claude Code-credentials-<sha256(dir)[:8]>` (ten sam klucz, którego używa Claude
+Code) i ma własny plik cache — wcześniej każda sesja pokazywała kubełki konta
+domyślnego. Ukośnik rozpoczyna kolejną linię
 wyjścia: `context,model,limits/git,duration,cost,render+time`. Claude Code dzieli
 wyjście po `\n`, renderuje każdą linię osobno (przyciemnioną i obcinaną do
 szerokości terminala) i przenosi otwarte sekwencje ANSI na kolejne linie.

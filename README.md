@@ -260,9 +260,18 @@ buckets exist solely in `GET /api/oauth/usage`, so the script fetches them
 itself, using Claude Code's own OAuth token (credentials file, else the macOS
 keychain). The token is never written anywhere; only the percentages are cached.
 
+Each account gets its own token and its own cache. Sessions started with a
+different `CLAUDE_CONFIG_DIR` are told apart the way Claude Code keys its
+credentials — the keychain service `Claude Code-credentials` gains a
+`-<sha256(dir)[:8]>` suffix, and `<dir>/.credentials.json` replaces the one in
+`~/.claude` — so every session shows its own account's buckets, not the default
+one's. When the variable is not inherited, the account is recovered from the
+transcript path, which always sits in `<dir>/projects/`. An account without an
+OAuth token (an API key login) simply has no per-model buckets.
+
 The request never happens in the render path. A detached `--refresh-usage`
-process writes a cache shared by every session on the machine, at most once per
-10 minutes and behind a lock, so five open terminals still make one request.
+process writes the account's cache, at most once per 10 minutes and behind a
+lock, so five open terminals on one account still make one request.
 Polling stops after 15 minutes of silence, backs off for 30 minutes on an
 authentication failure and 5 minutes on a network error, and the last good
 numbers stop being shown an hour after the last success.
@@ -332,9 +341,10 @@ the next one's: the worst case is what git alone already cost.
 | Path | Purpose |
 | --- | --- |
 | `$TMPDIR/claude-statusline-<hash>.json` | Per-transcript scan cache: offsets, totals, per-model cost split, time buckets. |
-| `$TMPDIR/claude-statusline-usage.json` | Shared plan usage cache, mode `0600`. Percentages only, never the token. |
+| `$TMPDIR/claude-statusline-usage.json` | Plan usage cache for the default account, mode `0600`. Percentages only, never the token. |
+| `$TMPDIR/claude-statusline-usage-<suffix>.json` | The same, one per account started with a different `CLAUDE_CONFIG_DIR`. |
 
-Both are disposable; deleting them costs one slow render.
+All of them are disposable; deleting them costs one slow render.
 
 ## Failure behaviour
 

@@ -160,12 +160,57 @@ def get_file_creation_time(path: str) -> float:
         return 0.0
 
 
+# --- Account ---
+
+DEFAULT_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".claude")
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def config_suffix(directory: str) -> str:
+    """Suffix Claude Code appends to the keychain service for a configured dir."""
+    import hashlib
+    import unicodedata
+
+    return hashlib.sha256(unicodedata.normalize("NFC", directory).encode("utf-8")).hexdigest()[:8]
+
+
+def account(transcript_path: str = "") -> tuple:
+    """(config dir, keychain suffix) of this session's account, keyed as Claude Code keys it.
+
+    The transcript, which sits in <dir>/projects/<project>/, covers an uninherited env.
+    """
+    override = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if override is not None:
+        return (override, config_suffix(override)) if override else (DEFAULT_CONFIG_DIR, "")
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        return configured, config_suffix(configured)
+    projects = os.path.dirname(os.path.dirname(transcript_path))
+    if os.path.basename(projects) == "projects":
+        derived = os.path.dirname(projects)
+        if derived != DEFAULT_CONFIG_DIR:
+            return derived, config_suffix(derived)
+    return DEFAULT_CONFIG_DIR, ""
+
+
+def keychain_account() -> str:
+    """Account name Claude Code files its keychain entry under."""
+    import getpass
+
+    try:
+        user = os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return "claude-code-user"
+    valid = user and all((c.isascii() and c.isalnum()) or c in "._-" for c in user)
+    return user if valid else "claude-code-user"
+
+
 # --- Model & effort ---
 
-def read_settings_effort() -> str:
+def read_settings_effort(directory: str = DEFAULT_CONFIG_DIR) -> str:
     """Fallback for payloads without effort.level (older Claude Code versions)."""
     try:
-        settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+        settings_path = os.path.join(directory, "settings.json")
         with open(settings_path, "r", encoding="utf-8") as sf:
             settings = json.load(sf)
         if not isinstance(settings, dict):
@@ -176,19 +221,19 @@ def read_settings_effort() -> str:
         return ""
 
 
-def get_effort(data: dict) -> str:
+def get_effort(data: dict, directory: str = DEFAULT_CONFIG_DIR) -> str:
     # Payload value reflects live /effort changes; settings.json goes stale mid-session
     effort_obj = data.get("effort")
     level = effort_obj.get("level") if isinstance(effort_obj, dict) else None
     if not isinstance(level, str) or not level:
-        level = read_settings_effort()
+        level = read_settings_effort(directory)
     if not level:
         return ""
     level = level.lower()
     return EFFORT_ABBREV.get(level, level)
 
 
-def model_segment(data: dict) -> str:
+def model_segment(data: dict, directory: str = DEFAULT_CONFIG_DIR) -> str:
     model_obj = data.get("model")
     model = model_obj.get("display_name") if isinstance(model_obj, dict) else None
     if not isinstance(model, str) or not model:
@@ -199,7 +244,7 @@ def model_segment(data: dict) -> str:
         cut = model.rfind(" (")
         if cut > 0:
             model = model[:cut]
-    effort = get_effort(data)
+    effort = get_effort(data, directory)
     if effort:
         model = f"{model} E/{effort}"
     if data.get("fast_mode") is True:
@@ -806,12 +851,12 @@ def lines_segment(data: dict) -> str:
 
 # --- Model-scoped usage windows (plan usage endpoint) ---
 
-def usage_cache_path() -> str:
+def usage_cache_path(suffix: str = "") -> str:
     import tempfile
 
-    # Shared by every session on the machine: five open terminals still make
-    # one request per TTL, not five.
-    return os.path.join(tempfile.gettempdir(), "claude-statusline-usage.json")
+    # One file per account, shared by all of its sessions.
+    name = f"claude-statusline-usage-{suffix}.json" if suffix else "claude-statusline-usage.json"
+    return os.path.join(tempfile.gettempdir(), name)
 
 
 def valid_usage_cache(cache) -> dict | None:
@@ -837,15 +882,15 @@ def valid_usage_cache(cache) -> dict | None:
     return out
 
 
-def read_usage_cache() -> dict | None:
+def read_usage_cache(suffix: str = "") -> dict | None:
     try:
-        with open(usage_cache_path(), "r", encoding="utf-8") as f:
+        with open(usage_cache_path(suffix), "r", encoding="utf-8") as f:
             return valid_usage_cache(json.load(f))
     except Exception:
         return None
 
 
-def write_usage_cache(windows: list, ok_ts: float, retry_s: float) -> None:
+def write_usage_cache(windows: list, ok_ts: float, retry_s: float, suffix: str = "") -> None:
     now = time.time()
     cache = {
         "v": USAGE_CACHE_VERSION,
@@ -854,7 +899,7 @@ def write_usage_cache(windows: list, ok_ts: float, retry_s: float) -> None:
         "next_try": now + retry_s,
         "windows": windows,
     }
-    path = usage_cache_path()
+    path = usage_cache_path(suffix)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
@@ -865,7 +910,7 @@ def write_usage_cache(windows: list, ok_ts: float, retry_s: float) -> None:
         pass
 
 
-def oauth_access_token() -> str | None:
+def oauth_access_token(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> str | None:
     """Claude Code's own OAuth token — credentials file, else the macOS Keychain.
 
     Never persisted anywhere by this script; only the resulting percentages are
@@ -874,19 +919,17 @@ def oauth_access_token() -> str | None:
     """
     raw = ""
     try:
-        with open(
-            os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json"),
-            "r", encoding="utf-8",
-        ) as f:
+        with open(os.path.join(directory, ".credentials.json"), "r", encoding="utf-8") as f:
             raw = f.read()
     except OSError:
         if sys.platform != "darwin":
             return None
         import subprocess
 
+        service = f"{KEYCHAIN_SERVICE}-{suffix}" if suffix else KEYCHAIN_SERVICE
         try:
             raw = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                ["security", "find-generic-password", "-a", keychain_account(), "-s", service, "-w"],
                 stderr=subprocess.DEVNULL, text=True, timeout=10,
             )
         except Exception:
@@ -938,9 +981,9 @@ def short_label(label: str, initials: list) -> str:
     return initial if initials.count(initial) == 1 else label
 
 
-def refresh_usage_cache() -> None:
-    """`--refresh-usage` entry point: one GET, then rewrite the shared cache."""
-    lock = f"{usage_cache_path()}.lock"
+def refresh_usage_cache(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> None:
+    """`--refresh-usage` entry point: one GET, then rewrite that account's cache."""
+    lock = f"{usage_cache_path(suffix)}.lock"
     try:
         if time.time() - os.stat(lock).st_mtime < USAGE_LOCK_S:
             return  # another refresher is in flight
@@ -952,14 +995,14 @@ def refresh_usage_cache() -> None:
     except OSError:
         return
     try:
-        previous = read_usage_cache()
-        token = oauth_access_token()
+        previous = read_usage_cache(suffix)
+        token = oauth_access_token(directory, suffix)
         if token is None:
             body, status = None, 401
         else:
             body, status = usage_request(token)
         if status == 200 and isinstance(body, dict):
-            write_usage_cache(scoped_windows(body), time.time(), 0)
+            write_usage_cache(scoped_windows(body), time.time(), 0, suffix)
         else:
             # Keep the last good numbers; the render side ages them out.
             retry = USAGE_RETRY_AUTH_S if status in (401, 403) else USAGE_RETRY_NET_S
@@ -967,6 +1010,7 @@ def refresh_usage_cache() -> None:
                 previous["windows"] if previous else [],
                 previous["ok_ts"] if previous else 0.0,
                 retry,
+                suffix,
             )
     finally:
         try:
@@ -997,14 +1041,24 @@ def usage_request(token: str) -> tuple:
         return None, 0
 
 
-def spawn_usage_refresh() -> None:
+def refresh_account(argv: list) -> tuple:
+    """(dir, suffix) handed over by the render that spawned this refresher."""
+    values = dict(arg.split("=", 1) for arg in argv if arg.startswith("--account-") and "=" in arg)
+    suffix = values.get("--account-key", "")
+    if len(suffix) == 8 and all(c in "0123456789abcdef" for c in suffix):
+        return values.get("--account-dir") or DEFAULT_CONFIG_DIR, suffix
+    return DEFAULT_CONFIG_DIR, ""
+
+
+def spawn_usage_refresh(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> None:
     """Fire and forget — the render must never wait on the network."""
     import subprocess
 
     kwargs = {"start_new_session": True} if os.name == "posix" else {}
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--refresh-usage"],
+            [sys.executable, os.path.abspath(__file__), "--refresh-usage",
+             f"--account-dir={directory}", f"--account-key={suffix}"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )
@@ -1012,7 +1066,7 @@ def spawn_usage_refresh() -> None:
         pass
 
 
-def scoped_limit_parts(last_activity: float) -> list:
+def scoped_limit_parts(last_activity: float, acct: tuple = (DEFAULT_CONFIG_DIR, "")) -> list:
     """Rendered per-model windows; may kick off a background refresh.
 
     A periodic refreshInterval keeps rendering long after the session goes
@@ -1021,15 +1075,15 @@ def scoped_limit_parts(last_activity: float) -> list:
     """
     if os.environ.get("STATUSLINE_NO_USAGE_API") == "1":
         return []
-    cache = read_usage_cache()
+    cache = read_usage_cache(acct[1])
     now = time.time()
     idle = 0 < last_activity < now - USAGE_IDLE_STOP_S
     if cache is None:
         if not idle:
-            spawn_usage_refresh()
+            spawn_usage_refresh(*acct)
         return []
     if not idle and now - cache["ts"] >= USAGE_CACHE_TTL_S and now >= cache["next_try"]:
-        spawn_usage_refresh()  # this render still draws the cached numbers
+        spawn_usage_refresh(*acct)  # this render still draws the cached numbers
     if now - cache["ok_ts"] > USAGE_STALE_S:
         return []
     live = [w for w in cache["windows"] if not w["resets_at"] or w["resets_at"] > now]
@@ -1064,7 +1118,7 @@ def format_remaining(resets_at) -> str:
     return f"{round(remaining / 86400)}d"
 
 
-def rate_limits_segment(data: dict, stats: dict) -> str:
+def rate_limits_segment(data: dict, stats: dict, acct: tuple = (DEFAULT_CONFIG_DIR, "")) -> str:
     rl = data.get("rate_limits")
     if not isinstance(rl, dict):
         return ""
@@ -1079,7 +1133,7 @@ def rate_limits_segment(data: dict, stats: dict) -> str:
         label = format_remaining(window.get("resets_at")) or fallback
         parts.append(f"{rate_color(pct)}{label}:{pct:.0f}%{RESET}")
     # per-model weekly buckets (e.g. Fable)
-    parts.extend(scoped_limit_parts(stats["last_activity"]))
+    parts.extend(scoped_limit_parts(stats["last_activity"], acct))
     return " ".join(parts)
 
 
@@ -1605,14 +1659,15 @@ def parse_texts(argv: list) -> list:
 
 
 def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> str:
-    model = model_segment(data)
+    transcript_path = data.get("transcript_path")
+    if not isinstance(transcript_path, str):
+        transcript_path = ""
+    acct = account(transcript_path)
+    model = model_segment(data, acct[0])
     workspace = data.get("workspace")
     cwd = workspace.get("current_dir") if isinstance(workspace, dict) else None
     if not isinstance(cwd, str):
         cwd = ""  # no workspace in payload → no git segment (don't leak process CWD)
-    transcript_path = data.get("transcript_path")
-    if not isinstance(transcript_path, str):
-        transcript_path = ""
 
     tier = family_tier(model)
     if transcript_path and os.path.isfile(transcript_path):
@@ -1631,7 +1686,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
         "model": lambda: f"{BLUE}{model}{RESET}{model_mix_segment(tier[0], stats)}",
         "tokens": lambda: f"{CYAN}{tokens_segment(stats)}{RESET}",
         "lines": lambda: lines_segment(data),
-        "limits": lambda: rate_limits_segment(data, stats),
+        "limits": lambda: rate_limits_segment(data, stats, acct),
         "git": lambda: vcs_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
@@ -1674,7 +1729,7 @@ def safe_print(line: str) -> None:
 
 def main() -> None:
     if "--refresh-usage" in sys.argv[1:]:
-        refresh_usage_cache()
+        refresh_usage_cache(*refresh_account(sys.argv[1:]))
         return
     try:
         # Bytes + lenient decode: invalid UTF-8 on stdin must not raise
