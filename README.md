@@ -48,6 +48,22 @@ costs about 60 ms of CPU each.
 Requires Python 3.9+ and nothing else — the script imports only the standard
 library.
 
+### Updates
+
+When a newer release exists, `⬆ v1.1.0` is appended to the end of the last row.
+To update, `git pull` in a clone, or download `statusline.py` again over the old
+one. `python3 statusline.py --version` prints the installed version.
+
+The check asks the GitHub API for the latest release of this repository, at most
+once every 6 hours (an hour after a failed attempt), from a detached background
+process — the render only reads the cached answer. It works for any install,
+clone or single file, because it compares release numbers rather than commits.
+`STATUSLINE_NO_UPDATE_CHECK=1` turns it off.
+
+Releasing is bumping `__version__` (`MAJOR.MINOR.PATCH`) on `main`: the
+`Release` workflow then tags the commit and publishes the release. Commits that
+leave the version alone never show up as an update.
+
 ## Blocks
 
 | Block | Example | Colour | What it shows |
@@ -150,6 +166,7 @@ of silence rather than running for as long as the terminal stays open.
 | `STATUSLINE_ESTIMATE_USAGE=1` | Adds the script's own cost estimate from the transcript: `~$71.20 ($67 $11/h)`, plus `+Fable 13%` next to the model when other model families took a share of the spend. Off by default, so nothing on the line can drift from real billing when the rate tables age. |
 | `STATUSLINE_DURATION_TOTAL=1` | Makes `duration` show the whole transcript instead of the current run. The `/ 7d` suffix then disappears, since it would repeat the figure. |
 | `STATUSLINE_NO_USAGE_API=1` | Disables the plan usage lookup entirely: no network, no keychain access, no per-model buckets in `limits`. |
+| `STATUSLINE_NO_UPDATE_CHECK=1` | Disables the release check: no request to GitHub, no `⬆` notice. |
 | `STATUSLINE_DEBUG=1` | Writes the received payload to `debug_input.json` next to the script. |
 
 Set them in the `env` block of `settings.json`.
@@ -165,7 +182,7 @@ theme change and survives the dimming Claude Code applies to the whole row.
 | --- | --- | --- |
 | 30 | `BLACK` | — |
 | 31 | `RED` | `context` and `limits` at 80%+, the removed half of `lines` and of the git delta |
-| 32 | `GREEN` | `context` under 50%, the added half of `lines` and of the git delta |
+| 32 | `GREEN` | `context` under 50%, the added half of `lines` and of the git delta, the `⬆` update notice |
 | 33 | `YELLOW` | `cost`, any window at 50%+, the cache countdown under 20 minutes |
 | 34 | `BLUE` | `model` |
 | 35 | `MAGENTA` | `duration` |
@@ -343,6 +360,7 @@ the next one's: the worst case is what git alone already cost.
 | `$TMPDIR/claude-statusline-<hash>.json` | Per-transcript scan cache: offsets, totals, per-model cost split, time buckets. |
 | `$TMPDIR/claude-statusline-usage.json` | Plan usage cache for the default account, mode `0600`. Percentages only, never the token. |
 | `$TMPDIR/claude-statusline-usage-<suffix>.json` | The same, one per account started with a different `CLAUDE_CONFIG_DIR`. |
+| `$TMPDIR/claude-statusline-update.json` | Latest release number and when to ask again. |
 
 All of them are disposable; deleting them costs one slow render.
 

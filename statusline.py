@@ -8,6 +8,8 @@ segment on bad input, and main() has a last-resort guard.
 
 from __future__ import annotations
 
+__version__ = "1.0.0"  # bumping it on main publishes a release
+
 import json
 import math
 import os
@@ -108,6 +110,12 @@ USAGE_RETRY_NET_S = 300  # transient failure: back off before asking again
 USAGE_RETRY_AUTH_S = 1800  # no/expired token: Claude Code owns the refresh
 USAGE_STALE_S = 3600  # past this the last good numbers stop being shown
 USAGE_IDLE_STOP_S = 900  # quiet for this long: stop polling, nobody is watching
+
+RELEASES_ENDPOINT = "https://api.github.com/repos/izzy667/claude-statusline/releases/latest"
+UPDATE_CACHE_VERSION = 1
+UPDATE_CHECK_S = 6 * 3600
+UPDATE_RETRY_S = 3600
+UPDATE_MARK = "⬆ "
 
 
 def as_number(value) -> float | None:
@@ -895,6 +903,39 @@ def read_usage_cache(suffix: str = "") -> dict | None:
         return None
 
 
+def write_json_atomic(path: str, obj: dict) -> None:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def acquire_lock(lock: str) -> bool:
+    """Exclusive lock file; one left behind by a killed process expires after USAGE_LOCK_S."""
+    try:
+        if time.time() - os.stat(lock).st_mtime < USAGE_LOCK_S:
+            return False
+        os.unlink(lock)
+    except OSError:
+        pass
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except OSError:
+        return False
+    return True
+
+
+def release_lock(lock: str) -> None:
+    try:
+        os.unlink(lock)
+    except OSError:
+        pass
+
+
 def write_usage_cache(windows: list, ok_ts: float, retry_s: float, suffix: str = "") -> None:
     now = time.time()
     cache = {
@@ -904,15 +945,7 @@ def write_usage_cache(windows: list, ok_ts: float, retry_s: float, suffix: str =
         "next_try": now + retry_s,
         "windows": windows,
     }
-    path = usage_cache_path(suffix)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    write_json_atomic(usage_cache_path(suffix), cache)
 
 
 def oauth_access_token(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> str | None:
@@ -989,15 +1022,7 @@ def short_label(label: str, initials: list) -> str:
 def refresh_usage_cache(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> None:
     """`--refresh-usage` entry point: one GET, then rewrite that account's cache."""
     lock = f"{usage_cache_path(suffix)}.lock"
-    try:
-        if time.time() - os.stat(lock).st_mtime < USAGE_LOCK_S:
-            return  # another refresher is in flight
-        os.unlink(lock)
-    except OSError:
-        pass
-    try:
-        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-    except OSError:
+    if not acquire_lock(lock):
         return
     try:
         previous = read_usage_cache(suffix)
@@ -1018,10 +1043,7 @@ def refresh_usage_cache(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -
                 suffix,
             )
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+        release_lock(lock)
 
 
 def usage_request(token: str) -> tuple:
@@ -1055,20 +1077,23 @@ def refresh_account(argv: list) -> tuple:
     return DEFAULT_CONFIG_DIR, ""
 
 
-def spawn_usage_refresh(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> None:
+def spawn_self(args: list) -> None:
     """Fire and forget — the render must never wait on the network."""
     import subprocess
 
     kwargs = {"start_new_session": True} if os.name == "posix" else {}
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--refresh-usage",
-             f"--account-dir={directory}", f"--account-key={suffix}"],
+            [sys.executable, os.path.abspath(__file__), *args],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )
     except Exception:
         pass
+
+
+def spawn_usage_refresh(directory: str = DEFAULT_CONFIG_DIR, suffix: str = "") -> None:
+    spawn_self(["--refresh-usage", f"--account-dir={directory}", f"--account-key={suffix}"])
 
 
 def scoped_limit_parts(last_activity: float, acct: tuple = (DEFAULT_CONFIG_DIR, "")) -> list:
@@ -1097,6 +1122,87 @@ def scoped_limit_parts(last_activity: float, acct: tuple = (DEFAULT_CONFIG_DIR, 
         f"{rate_color(w['pct'])}{short_label(w['label'], initials)}:{w['pct']:.0f}%{RESET}"
         for w in live
     ]
+
+
+# --- Update notice (latest GitHub release) ---
+
+def parse_version(text) -> tuple | None:
+    """"v1.2.3" or "1.2.3" -> (1, 2, 3); None for anything else."""
+    if not isinstance(text, str):
+        return None
+    parts = text.strip().removeprefix("v").split(".")
+    if len(parts) != 3 or not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def update_cache_path() -> str:
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), "claude-statusline-update.json")
+
+
+def read_update_cache() -> dict | None:
+    try:
+        with open(update_cache_path(), "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(cache, dict) or cache.get("v") != UPDATE_CACHE_VERSION:
+        return None
+    next_try = as_number(cache.get("next_try"))
+    latest = cache.get("latest")
+    if next_try is None or not isinstance(latest, str):
+        return None
+    return {"next_try": next_try, "latest": latest}
+
+
+def latest_release() -> str | None:
+    import urllib.request
+
+    request = urllib.request.Request(
+        RELEASES_ENDPOINT,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "claude-statusline"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=USAGE_TIMEOUT_S) as response:
+            body = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    tag = body.get("tag_name") if isinstance(body, dict) else None
+    version = parse_version(tag)
+    return ".".join(map(str, version)) if version else None
+
+
+def refresh_update_cache() -> None:
+    """`--check-update` entry point: one GET, then rewrite the update cache."""
+    lock = f"{update_cache_path()}.lock"
+    if not acquire_lock(lock):
+        return
+    try:
+        latest = latest_release()
+        if latest is None:
+            previous = read_update_cache()
+            latest, retry = (previous["latest"] if previous else ""), UPDATE_RETRY_S
+        else:
+            retry = UPDATE_CHECK_S
+        cache = {"v": UPDATE_CACHE_VERSION, "next_try": time.time() + retry, "latest": latest}
+        write_json_atomic(update_cache_path(), cache)
+    finally:
+        release_lock(lock)
+
+
+def update_segment() -> str:
+    """Newer release than this script, if any; may kick off a background check."""
+    if os.environ.get("STATUSLINE_NO_UPDATE_CHECK") == "1":
+        return ""
+    cache = read_update_cache()
+    if cache is None or time.time() >= cache["next_try"]:
+        spawn_self(["--check-update"])
+    latest = parse_version(cache["latest"]) if cache else None
+    if latest is None or latest <= parse_version(__version__):
+        return ""
+    return f"{GREEN}{UPDATE_MARK}v{cache['latest']}{RESET}"
 
 
 # --- Rate limits ---
@@ -1761,6 +1867,11 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
             line += joiner + join_pair(bracket, texts)
         if line:  # a line whose blocks all came out empty leaves no blank row
             rendered.append(line)
+    notice = update_segment()
+    if notice and rendered:
+        rendered[-1] += BLOCK_SEPARATOR + notice
+    elif notice:
+        rendered.append(notice)
     return "\n".join(rendered)
 
 
@@ -1773,8 +1884,14 @@ def safe_print(line: str) -> None:
 
 
 def main() -> None:
+    if "--version" in sys.argv[1:]:
+        safe_print(f"{__version__}\n")
+        return
     if "--refresh-usage" in sys.argv[1:]:
         refresh_usage_cache(*refresh_account(sys.argv[1:]))
+        return
+    if "--check-update" in sys.argv[1:]:
+        refresh_update_cache()
         return
     try:
         # Bytes + lenient decode: invalid UTF-8 on stdin must not raise
