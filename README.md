@@ -7,12 +7,12 @@ command on stdin; the script prints the line to stdout and exits.
 Out of the box it renders a single row:
 
 ```
-487K/1M (48%) | 6h23m (⧗ 1h49m) | $69 ($11/h) | Opus 5 E/xhigh | ↓106.1M ↑362.2K C:95% | +140/-40 | 2h:22% 18h:14% F:6% | main ○ | 64ms
+487K/1M (48%) | 6h23m (⧗ 1h49m) | $69 ($11/h) | Opus 5 E/xhigh | ↓106.1M ↑362.2K C:95% | +140/-40 | 2h:22% 18h:14% F:6% | main ○ | 64ms (14:11 ↻ 38m)
 ```
 
 Which blocks appear, in what order, and how many rows they occupy is all
-configurable — see [Layout](#layout). Split over two rows with the clock and the
-cache countdown added, the same session reads:
+configurable — see [Layout](#layout). Split over two rows, without `tokens`, the
+same session reads:
 
 ```
 487K/1M (48%) | Opus 5 E/xhigh | +140/-40 | 2h:22% 18h:14% F:6%
@@ -81,7 +81,7 @@ leave the version alone never show up as an update.
 | `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. Under Claude Code's cache keepalive (a 5-minute cache renewed while idle, enabled per account by the `tengu_sequential_cloud` flag in `.claude.json`) it counts to the end of the keepalive instead: last transcript write + the flag's `activityWindowMinutes` + 5 minutes. |
 | `text` | `◆ prod` | grey | A literal label of your own, supplied with `--text=`. See [Labels](#labels). |
 
-`time` and `text` sit outside the default order — ask for them by name. Any block
+`text` sits outside the default order — ask for it by name. Any block
 can be repainted from the layout argument with `:colour`, see
 [Colours](#colours).
 
@@ -102,7 +102,7 @@ what order:
 | `a:colour` | Repaints one block, e.g. `time:black,context:green`. See [Colours](#colours). |
 
 Without the argument the default order applies:
-`context, duration, cost, model, tokens, lines, limits, git, task, render`.
+`context, duration, cost, model, tokens, lines, limits, git, task, render+time`.
 
 Unknown names are dropped so one typo cannot blank the line; an argument with
 nothing usable in it falls back to the default. Block names are deduplicated,

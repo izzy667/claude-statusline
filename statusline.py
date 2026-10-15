@@ -8,7 +8,7 @@ segment on bad input, and main() has a last-resort guard.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"  # bumping it on main publishes a release
+__version__ = "1.0.1"  # bumping it on main publishes a release
 
 import json
 import math
@@ -1669,15 +1669,16 @@ def time_segment(data: dict, directory: str = DEFAULT_CONFIG_DIR) -> str:
     return f"{GRAY}{' '.join(parts)}{RESET}"
 
 
-# Default order, applied when the command carries no block argument.
-BLOCK_ORDER = (
-    "context", "duration", "cost", "model", "tokens",
-    "lines", "limits", "git", "task", "render",
+# Default line, applied when the command carries no block argument.
+DEFAULT_ORDER = (
+    ("context",), ("duration",), ("cost",), ("model",), ("tokens",),
+    ("lines",), ("limits",), ("git",), ("task",), ("render", "time"),
 )
+BLOCK_ORDER = tuple(name for pair in DEFAULT_ORDER for name in pair)
 # Blocks outside the default line — available only by naming them explicitly.
 TEXT_BLOCK = "text"  # literal label, one --text= value per occurrence
 TEXT_FLAG = "--text="
-EXTRA_BLOCKS = ("time", TEXT_BLOCK)
+EXTRA_BLOCKS = (TEXT_BLOCK,)
 BLOCK_NAMES = BLOCK_ORDER + EXTRA_BLOCKS
 # "a+b" renders b bracketed after a; the brackets take the colour of the block
 # they belong to. Blocks that paint themselves are absent here.
@@ -1697,8 +1698,8 @@ COLORS = {
     "bright_blue": BRIGHT_BLUE, "bright_magenta": BRIGHT_MAGENTA,
     "bright_cyan": BRIGHT_CYAN, "white": WHITE,
 }
-# One row, one block per cell — the shape build_line and parse_blocks work in.
-DEFAULT_LAYOUT = (tuple((name,) for name in BLOCK_ORDER),)
+# One row of cells, each a block or a pair — the shape build_line and parse_blocks work in.
+DEFAULT_LAYOUT = (DEFAULT_ORDER,)
 # "branch - task" reads as one unit, so the task block keeps the dash it had.
 BLOCK_JOINERS = {"task": " - "}
 BLOCK_SEPARATOR = " | "
