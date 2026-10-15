@@ -88,6 +88,11 @@ WAIT_MARK = "⧗ "  # marks the waiting time so two clocks side by side stay rea
 # request, so what it counts down is time until the next refresh is needed.
 CACHE_MARK = "↻ "
 CACHE_WARN_MIN = 20  # highlight once the warm window is worth hurrying back for
+# Claude Code renews a 5m cache while idle, until this server flag's activity window lapses.
+KEEPALIVE_FLAG = "tengu_sequential_cloud"
+KEEPALIVE_WINDOW_DEFAULT_MIN = 60
+KEEPALIVE_TTL = "5m"
+KEEPALIVE_TTL_S = 300
 MODEL_MIX_MAX = 2  # extra model families shown next to the main-loop model
 MODEL_MIX_MIN_PCT = 1  # below this share of session cost a family is noise
 
@@ -1488,27 +1493,67 @@ def render_segment() -> str:
     return f"{GRAY}{elapsed_ms():.0f}ms{RESET}"
 
 
-def cache_minutes_left(data: dict) -> int | None:
+def global_config_path(directory: str) -> str:
+    """Claude Code's .claude.json: in the home dir for the default account, inside the dir otherwise."""
+    if directory == DEFAULT_CONFIG_DIR:
+        return os.path.join(os.path.expanduser("~"), ".claude.json")
+    return os.path.join(directory, ".claude.json")
+
+
+def keepalive_window_s(directory: str) -> float | None:
+    """Idle seconds Claude Code keeps touching the cache for; None when keepalive is off."""
+    try:
+        with open(global_config_path(directory), "r", encoding="utf-8") as f:
+            flag = json.load(f).get("cachedGrowthBookFeatures", {}).get(KEEPALIVE_FLAG)
+    except Exception:
+        return None
+    if not isinstance(flag, dict) or flag.get("enabled", True) is not True:
+        return None
+    minutes = as_number(flag.get("activityWindowMinutes", KEEPALIVE_WINDOW_DEFAULT_MIN))
+    return minutes * 60 if minutes is not None and minutes > 0 else None
+
+
+def last_activity(data: dict) -> float | None:
+    """When the session last did anything: the transcript is appended on every turn."""
+    path = data.get("transcript_path")
+    try:
+        return os.path.getmtime(path) if isinstance(path, str) and path else None
+    except OSError:
+        return None
+
+
+def cache_deadline(data: dict, cache: dict, expires: float, directory: str) -> float:
+    """When the cache really goes cold: a 5m entry under keepalive outlives expires_at."""
+    if cache.get("ttl") != KEEPALIVE_TTL:
+        return expires
+    window = keepalive_window_s(directory)
+    active = last_activity(data)
+    if window is None or active is None:
+        return expires
+    return max(expires, active + window + KEEPALIVE_TTL_S)
+
+
+def cache_minutes_left(data: dict, directory: str = DEFAULT_CONFIG_DIR) -> int | None:
     """Whole minutes before the prompt cache goes cold; None when it is not warm.
 
-    expires_at rolls forward with every request, so this sits at the full TTL
-    while you work and only starts counting down once the session goes quiet —
-    which is exactly when the answer matters.
+    The deadline rolls forward with every request, so this sits at its full
+    length while you work and only starts counting down once the session goes quiet.
     """
     cache = data.get("prompt_cache")
     if not isinstance(cache, dict) or cache.get("warm") is not True:
         return None
     expires = as_number(cache.get("expires_at"))
-    if expires is None:
+    now = time.time()
+    if expires is None or expires <= now:
         return None
-    left = expires - time.time()
-    return math.ceil(left / 60) if left > 0 else None
+    left = cache_deadline(data, cache, expires, directory) - now
+    return math.ceil(left / 60)
 
 
-def time_segment(data: dict) -> str:
+def time_segment(data: dict, directory: str = DEFAULT_CONFIG_DIR) -> str:
     """Wall clock, plus what is left of the warm prompt cache."""
     parts = [time.strftime("%H:%M")]
-    left = cache_minutes_left(data)
+    left = cache_minutes_left(data, directory)
     if left is not None:
         countdown = f"{CACHE_MARK}{left}m"
         if left < CACHE_WARN_MIN:
@@ -1690,7 +1735,7 @@ def build_line(data: dict, layout: tuple = DEFAULT_LAYOUT, texts: list = ()) -> 
         "git": lambda: vcs_segment(cwd) if cwd else "",
         "task": lambda: task_segment(stats["last_task"]),
         "render": render_segment,
-        "time": lambda: time_segment(data),
+        "time": lambda: time_segment(data, acct[0]),
         TEXT_BLOCK: lambda: text_block(pending_texts),
     }
 

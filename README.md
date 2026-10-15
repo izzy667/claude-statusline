@@ -62,7 +62,7 @@ library.
 | `git` | `main (a3f9c21) ● ~1 (+44/-20)` | cyan, delta green and red | Branch, the commit the working copy sits on, its state, and the uncommitted line delta against `HEAD`. `○` clean, `●` dirty, then `+N` added or untracked, `~N` modified, `-N` deleted files. Reads git or Plastic SCM, whichever holds the directory — see [Version control](#version-control). |
 | `task` | `- Refactor the parser` | none, terminal default | Description of the most recent `Task` tool call. Attaches to the preceding block with a dash. |
 | `render` | `56ms` | grey | How long this render took. |
-| `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. |
+| `time` | `13:51 ↻ 42m` | grey, countdown yellow under 20 minutes | Wall clock, then minutes of warm prompt cache left. Disappears when the cache is cold. Under Claude Code's cache keepalive (a 5-minute cache renewed while idle, enabled per account by the `tengu_sequential_cloud` flag in `.claude.json`) it counts to the end of the keepalive instead: last transcript write + the flag's `activityWindowMinutes` + 5 minutes. |
 | `text` | `◆ prod` | grey | A literal label of your own, supplied with `--text=`. See [Labels](#labels). |
 
 `time` and `text` sit outside the default order — ask for them by name. Any block
